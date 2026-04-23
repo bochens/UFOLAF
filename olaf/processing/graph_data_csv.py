@@ -14,10 +14,10 @@ from olaf.utils.plot_utils import plot_INPS_L
 
 class GraphDataCSV(DataHandler):
     """
-    This class is called after the last image is reviewed in the GUI closes,
-    and after the .csv file with the temperature ranges and frozen wells is created.
-    It has a function that reads in an above-mentioned .csv file and calculates the
-    INPs/L to use per temperature over all the dilutions for the experiment.
+    This class is called after the reviewed frozen-well data have been converted into
+    a `.csv` file with temperature ranges and frozen wells. It reads that file and
+    calculates the INPs/L to use per temperature over all the dilutions for the
+    experiment.
 
     """
 

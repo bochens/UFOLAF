@@ -44,8 +44,8 @@ class SpacedTempCSV(DataHandler):
         """
         Creates a .csv file that contains the number of frozen wells per sample at
         temperatures with intervals off "temp_steps" (default: 0.5 C).
-        folder (...). This function is automatically ran after the last image is
-        reviewed and the GUI closes. It uses the data file to find the first frozen well.
+        folder (...). This function operates on an existing reviewed `.dat` file and
+        uses that file to find the first frozen well.
         The logic is as follows:
         1. find the first row with a non-zero value for least diluted sample.
         2. Round this value to 1 decimal (first_frozen)

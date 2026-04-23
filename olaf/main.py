@@ -1,12 +1,11 @@
 import re
-import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 
 from olaf.CONSTANTS import DATE_PATTERN
-from olaf.image_verification.freezing_reviewer import FreezingReviewer
 from olaf.processing.graph_data_csv import GraphDataCSV
 from olaf.processing.spaced_temp_csv import SpacedTempCSV
+from olaf.utils.path_utils import find_latest_file
 
 # -----------------------------    USER INPUTS    -------------------------------------
 #test_folder = Path.cwd().parent / "tests" /"test_data" / "fpd" / "NSA no.2 05.22.25 base"
@@ -67,14 +66,33 @@ dry_mass = 2  # dried mass of soil in g
 freezing_point_depression_dict = {1:2, 11:0.2}
 
 
-# ----------------------- Assembling the header for the CSV file -----------------------
-header = (
-    f"site = {site}\nstart_time = {start_time}\nend_time = {end_time}\n"
-    f"filter_color = {filter_color}\nsample_type = {sample_type}\n"
-    f"vol_air_filt = {vol_air_filt}\nproportion_filter_used = {proportion_filter_used}\n"
-    f"vol_susp = {vol_susp}\ntreatment = {treatment[0]}\nnotes = {notes}\n"
-    f"user = {user}\nIS = {IS}\n"
-)
+def build_header(current_vol_air_filt: float) -> str:
+    return (
+        f"site = {site}\nstart_time = {start_time}\nend_time = {end_time}\n"
+        f"filter_color = {filter_color}\nsample_type = {sample_type}\n"
+        f"vol_air_filt = {current_vol_air_filt}\n"
+        f"proportion_filter_used = {proportion_filter_used}\n"
+        f"vol_susp = {vol_susp}\ntreatment = {treatment[0]}\nnotes = {notes}\n"
+        f"user = {user}\nIS = {IS}\n"
+    )
+
+
+def find_reviewed_data_file(folder_path: Path, includes: tuple[str, ...]) -> Path:
+    reviewed_files = [
+        file
+        for file in folder_path.iterdir()
+        if file.suffix == ".dat"
+        and "reviewed" in file.name
+        and all(name in file.name for name in includes)
+        and "frozen" not in file.name
+    ]
+    reviewed_file = find_latest_file(reviewed_files)
+    if reviewed_file is None:
+        raise FileNotFoundError(
+            "UFOLAF no longer includes the freezing-review GUI. "
+            f"Expected a reviewed .dat file in {folder_path} that matches {includes}."
+        )
+    return reviewed_file
 
 
 if __name__ == "__main__":
@@ -97,21 +115,12 @@ if __name__ == "__main__":
     if "soil" in sample_type:
         vol_air_filt = vol_susp / dry_mass
 
+    header = build_header(vol_air_filt)
     if "TBS" in site:
         header += f"lower_altitude = {lower_altitude}\nupper_altitude = {upper_altitude}\n"
 
-
-    # GUI
-    window = tk.Tk()
-    app = FreezingReviewer(
-        window,
-        test_folder,
-        num_samples,
-        wells_per_sample,
-        dict_samples_to_dilution,
-        includes=treatment,
-    )
-    window.mainloop()
+    reviewed_data_file = find_reviewed_data_file(test_folder, treatment)
+    print(f"Using reviewed input file: {reviewed_data_file.name}")
 
     # # Processing to create .csv file
     spaced_temp_csv = SpacedTempCSV(test_folder, num_samples, includes=treatment)
@@ -132,7 +141,6 @@ if __name__ == "__main__":
         # Compare the two dates
         if date_obj.date() != start_time_obj.date():
             print(f"Date {date} does not match with the specified start time: {start_time}")
-            ValueError("Date does not match with the specified start time")
             continue
         # add date to includes
         print(f"Processing data for: {site} {date}")
