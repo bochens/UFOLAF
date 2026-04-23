@@ -6,4 +6,4 @@ UFOLAF was created to support easier integration with Icescopy, another image-an
 
 This project is based on OLAF. Original OLAF documentation is available [here](https://sigran.github.io/OLAF/). If you use UFOLAF in research, please also cite the original OLAF release: https://doi.org/10.5281/zenodo.17509699
 
-UFOLAF preserves the original OLAF copyright and license notices. Modifications in FOLAF are identified as changes from the original project.
+UFOLAF preserves the original OLAF copyright and license notices. Modifications in UFOLAF are identified as changes from the original project.
