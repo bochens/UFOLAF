@@ -1,4 +1,6 @@
 
+<img src="assets/ufolaf-logo.png" align="right" height="90" />
+
 # UFOLAF
 UFOLAF is an unofficial fork of OLAF (OpenSource Library for Automating Freezing data acquisition from Ice Nucleation Spectrometer). It is maintained independently and is not affiliated with or endorsed by the original OLAF authors.
 
