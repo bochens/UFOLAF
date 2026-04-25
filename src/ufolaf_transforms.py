@@ -33,7 +33,6 @@ from ufolaf_models import (
 
 CyclePolicy = Literal["single", "pooled", "preserve"]
 TemperatureReductionMethod = Literal["max", "latest"]
-StitchRowPolicy = Literal["olaf", "non_saturated", "partial_only", "all"]
 OLAF_AGRESTI_COULL_UNCERTAIN_VALUES = 2
 
 
@@ -520,7 +519,6 @@ def temperature_frozen_fraction_to_stitched_cumulative_spectrum(
     *,
     sample_group_by: Literal["sample_id", "sample_name", "sample_long_name"]
     | dict[str, str] = "sample_long_name",
-    row_policy: StitchRowPolicy = "olaf",
     enforce_monotone: bool = False,
     z: float = 1.96,
 ) -> CumulativeNucleusSpectrumTable:
@@ -529,12 +527,10 @@ def temperature_frozen_fraction_to_stitched_cumulative_spectrum(
     The default follows OLAF's dilution-transition logic: start from the least
     diluted spectrum, inspect the last four valid overlap points before switching
     dilution, use the same confidence-interval decision tree, then use the next
-    dilution for colder temperatures. ``row_policy="olaf"`` also applies OLAF's
-    near-saturation pruning with a two-well Agresti-Coull margin.
+    dilution for colder temperatures. OLAF's near-saturation pruning is applied
+    with a two-well Agresti-Coull margin.
     """
 
-    if row_policy not in ("olaf", "non_saturated", "partial_only", "all"):
-        raise ValueError("row_policy must be 'olaf', 'non_saturated', 'partial_only', or 'all'")
     metadata_by_sample_id = resolve_metadata_by_sample_id(table, metadata_by_sample_id)
     per_dilution = temperature_frozen_fraction_to_cumulative_spectrum(
         table,
@@ -582,7 +578,6 @@ def temperature_frozen_fraction_to_stitched_cumulative_spectrum(
         stitched_group = _stitch_cumulative_group(
             group_df,
             str(group_id),
-            row_policy=row_policy,
             enforce_monotone=enforce_monotone,
         )
         if not stitched_group.empty:
@@ -615,7 +610,7 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
     *,
     sample_group_by: Literal["sample_id", "sample_name", "sample_long_name"]
     | dict[str, str] = "sample_long_name",
-    row_policy: Literal["all", "non_saturated", "partial_only"] = "all",
+    enforce_monotone: bool = False,
     confidence_drop: float = PROFILE_LIKELIHOOD_DROP_95,
 ) -> CumulativeNucleusSpectrumTable:
     """Combine dilution rows with a binomial-Poisson MLE at each temperature.
@@ -630,12 +625,10 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
     same original sample. Use a dict for explicit sample_id -> group_id mapping,
     or one of the metadata fields listed in the type annotation.
 
-    ``row_policy`` controls boundary rows: ``all`` keeps 0/n and n/n rows,
-    ``non_saturated`` drops n/n rows, and ``partial_only`` keeps only 0 < x < n.
+    When ``enforce_monotone`` is true, colder K(T) values are carried forward if
+    the independent per-temperature MLE would otherwise decrease.
     """
 
-    if row_policy not in ("all", "non_saturated", "partial_only"):
-        raise ValueError("row_policy must be 'all', 'non_saturated', or 'partial_only'")
     metadata_by_sample_id = resolve_metadata_by_sample_id(table, metadata_by_sample_id)
     source_df = table.to_dataframe()
     if source_df.empty:
@@ -668,7 +661,7 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
             str(group_id),
             _combined_source_metadata(str(group_id), metadata_sample_ids, metadata_rows, "mle"),
         )
-        fit_df = _filter_mle_rows(group_df, row_policy)
+        fit_df = group_df
         if fit_df.empty:
             value = np.nan
             lower_error = np.nan
@@ -725,6 +718,8 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
             metadata=output_metadata,
         )
     result = result.sort_values(["sample_id", "temperature_C"], ascending=[True, False])
+    if enforce_monotone:
+        result = _enforce_monotone_cumulative_dataframe(result)
     return CumulativeNucleusSpectrumTable.from_dataframe(
         result,
         value_unit="INP_per_mL_suspension",
@@ -890,25 +885,13 @@ def _normalize_metadata_mapping(metadata: MetadataLike) -> dict[str, SampleMetad
     return copied
 
 
-def _filter_mle_rows(
-    df: pd.DataFrame,
-    row_policy: Literal["all", "non_saturated", "partial_only"],
-) -> pd.DataFrame:
-    if row_policy == "all":
-        return df
-    if row_policy == "non_saturated":
-        return df[df["n_frozen"] < df["n_total"]]
-    return df[(df["n_frozen"] > 0) & (df["n_frozen"] < df["n_total"])]
-
-
 def _stitch_cumulative_group(
     group_df: pd.DataFrame,
     group_id: str,
     *,
-    row_policy: StitchRowPolicy,
     enforce_monotone: bool,
 ) -> pd.DataFrame:
-    group_df = _prepare_olaf_stitch_frame(group_df, row_policy)
+    group_df = _prepare_olaf_stitch_frame(group_df)
     if group_df.empty:
         return pd.DataFrame()
 
@@ -984,7 +967,6 @@ def _stitch_cumulative_group(
 
 def _prepare_olaf_stitch_frame(
     group_df: pd.DataFrame,
-    row_policy: StitchRowPolicy,
 ) -> pd.DataFrame:
     df = group_df.copy()
     df = df[np.isfinite(df["dilution_fold"])].copy()
@@ -993,15 +975,7 @@ def _prepare_olaf_stitch_frame(
             df[column] = pd.to_numeric(df[column], errors="coerce")
 
     valid = np.isfinite(df["value"])
-    if row_policy == "olaf":
-        valid &= df["n_frozen"] < (df["n_total"] - OLAF_AGRESTI_COULL_UNCERTAIN_VALUES)
-    elif row_policy == "non_saturated":
-        valid &= df["n_frozen"] < df["n_total"]
-    elif row_policy == "partial_only":
-        valid &= (df["n_frozen"] > 0) & (df["n_frozen"] < df["n_total"])
-    elif row_policy != "all":
-        raise ValueError("row_policy must be 'olaf', 'non_saturated', 'partial_only', or 'all'")
-
+    valid &= df["n_frozen"] < (df["n_total"] - OLAF_AGRESTI_COULL_UNCERTAIN_VALUES)
     df.loc[~valid, ["value", "lower_ci", "upper_ci"]] = np.nan
     return df.sort_values(["temperature_C", "dilution_fold"], ascending=[False, True])
 
@@ -1200,6 +1174,29 @@ def _enforce_monotone_stitch_result(result: pd.DataFrame) -> None:
             result.at[index, "qc_flag"] = int(result.at[index, "qc_flag"]) | 2
         previous_value = result.at[index, "value"]
         previous_upper_ci = result.at[index, "upper_ci"]
+
+
+def _enforce_monotone_cumulative_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    result = df.copy()
+    for _, group_index in result.groupby("sample_id", sort=False).groups.items():
+        ordered_index = result.loc[group_index].sort_values(
+            "temperature_C",
+            ascending=False,
+        ).index
+        previous_value = np.nan
+        previous_upper_ci = np.nan
+        for index in ordered_index:
+            value = result.at[index, "value"]
+            if not np.isfinite(value):
+                continue
+            if np.isfinite(previous_value) and value < previous_value:
+                current_upper_ci = result.at[index, "upper_ci"]
+                result.at[index, "value"] = previous_value
+                result.at[index, "upper_ci"] = _rms_pair(current_upper_ci, previous_upper_ci)
+                result.at[index, "qc_flag"] = int(result.at[index, "qc_flag"]) | 2
+            previous_value = result.at[index, "value"]
+            previous_upper_ci = result.at[index, "upper_ci"]
+    return result
 
 
 def _stitch_row_from_result(
