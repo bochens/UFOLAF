@@ -1,18 +1,20 @@
 """Public UFOLAF API.
 
-This module is intentionally a thin facade. Implementation functions keep their
-long descriptive names in the underlying modules; this file exposes the shorter
-names intended for normal analysis scripts and notebooks.
+This module is intentionally a thin facade that exposes short names intended for
+normal analysis scripts and notebooks.
 """
 
 from ufolaf_adapters import (
-    infer_icescopy_dilution_group_map as infer_dilution_groups,
-    parse_olaf_frozen_at_temp_csv,
-    read_icescopy_freeze_count_timeseries_csv as read_icescopy_counts,
-    read_icescopy_sample_metadata as read_icescopy_metadata,
-    read_icescopy_temperature_sync_csv as read_icescopy_temperature_sync,
-    sample_metadata_to_dataframe as sample_metadata_dataframe,
+    infer_dilution_groups,
+    map_count_columns,
+    metadata_frame,
+    parse_olaf_frozen_at_temp,
+    parse_sync_wide,
+    read_counts,
+    read_metadata,
+    read_sync,
 )
+from ufolaf_blank_math import average_blank_spectra, subtract_blank_spectrum
 from ufolaf_models import (
     CountsTable,
     CumulativeNucleusSpectrumTable,
@@ -22,6 +24,7 @@ from ufolaf_models import (
     TemperatureDependentTable,
     TemperatureFrozenFractionTable,
 )
+from ufolaf_qc import enforce_monotonic_vs_temperature
 from ufolaf_transforms import (
     apply_water_blank_correction as apply_water_blank,
     counts_to_temperature_frozen_fraction as fraction_frozen,
@@ -41,16 +44,21 @@ __all__ = [
     "TemperatureDependentTable",
     "TemperatureFrozenFractionTable",
     "apply_water_blank",
+    "average_blank_spectra",
     "cumulative_spec",
     "cumulative_spec_mle",
     "cumulative_spec_stitch",
     "differential_spec",
+    "enforce_monotonic_vs_temperature",
     "fraction_frozen",
     "infer_dilution_groups",
+    "map_count_columns",
+    "metadata_frame",
     "normalize_spec",
-    "parse_olaf_frozen_at_temp_csv",
-    "read_icescopy_counts",
-    "read_icescopy_metadata",
-    "read_icescopy_temperature_sync",
-    "sample_metadata_dataframe",
+    "parse_olaf_frozen_at_temp",
+    "parse_sync_wide",
+    "read_counts",
+    "read_metadata",
+    "read_sync",
+    "subtract_blank_spectrum",
 ]

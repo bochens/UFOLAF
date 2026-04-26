@@ -173,7 +173,6 @@ def _counts_dataframe_to_temperature_frozen_fraction(
             temperature_bin_method=temperature_bin_method,
             metadata=metadata,
         )
-
     df["temperature_C"] = bin_temperature(df["temperature_C"].to_numpy(copy=True), step_C)
     sort_columns = ["sample_id", "temperature_C"]
     ascending = [True, False]
@@ -625,8 +624,10 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
     same original sample. Use a dict for explicit sample_id -> group_id mapping,
     or one of the metadata fields listed in the type annotation.
 
-    When ``enforce_monotone`` is true, colder K(T) values are carried forward if
-    the independent per-temperature MLE would otherwise decrease.
+    When ``enforce_monotone`` is true, a monotone constrained MLE is fit by
+    pooling adjacent temperature blocks until K(T) is nondecreasing toward colder
+    temperatures. ``lower_ci`` and ``upper_ci`` remain OLAF-compatible error
+    widths, not absolute limits.
     """
 
     metadata_by_sample_id = resolve_metadata_by_sample_id(table, metadata_by_sample_id)
@@ -649,61 +650,31 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
         for sample_id in source_df["source_sample_id"]
     ]
 
-    frames: list[pd.DataFrame] = []
     output_metadata: dict[str, SampleMetadata] = {}
-    for (group_id, temperature_C), group_df in source_df.groupby(
-        ["mle_group_id", "temperature_C"],
-        sort=False,
-    ):
-        metadata_sample_ids = group_df["source_sample_id"].astype(str).to_numpy(copy=True)
+    frames: list[pd.DataFrame] = []
+    for group_id, mle_group_df in source_df.groupby("mle_group_id", sort=False):
+        metadata_sample_ids = mle_group_df["source_sample_id"].astype(str).unique()
         metadata_rows = [metadata_by_sample_id[sample_id] for sample_id in metadata_sample_ids]
         output_metadata.setdefault(
             str(group_id),
             _combined_source_metadata(str(group_id), metadata_sample_ids, metadata_rows, "mle"),
         )
-        fit_df = group_df
-        if fit_df.empty:
-            value = np.nan
-            lower_error = np.nan
-            upper_error = np.nan
-            finite = False
-            dilution_fold = np.nan
+        if enforce_monotone:
+            group_result = _constrained_mle_cumulative_group(
+                mle_group_df,
+                str(group_id),
+                metadata_by_sample_id,
+                confidence_drop=confidence_drop,
+            )
         else:
-            fit_sample_ids = fit_df["source_sample_id"].astype(str).to_numpy(copy=True)
-            fit_metadata = [metadata_by_sample_id[sample_id] for sample_id in fit_sample_ids]
-            well_volume_uL = _shared_well_volume_uL(fit_metadata, str(group_id))
-            dilution = np.array(
-                [metadata.dilution or 0.0 for metadata in fit_metadata],
-                dtype=float,
+            group_result = _independent_mle_cumulative_group(
+                mle_group_df,
+                str(group_id),
+                metadata_by_sample_id,
+                confidence_drop=confidence_drop,
             )
-            if np.any(dilution <= 0):
-                raise ValueError(f"All dilutions must be positive for MLE group {group_id!r}")
-
-            value, lower_error, upper_error, finite = (
-                binomial_poisson_mle_with_profile_errors(
-                    fit_df["n_frozen"].to_numpy(dtype=float, copy=True),
-                    fit_df["n_total"].to_numpy(dtype=float, copy=True),
-                    well_volume_uL,
-                    dilution,
-                    confidence_drop=confidence_drop,
-                )
-            )
-            dilution_fold = dilution[0] if len(pd.unique(dilution)) == 1 else np.nan
-        out = pd.DataFrame(
-            {
-                "sample_id": [str(group_id)],
-                "temperature_C": [float(temperature_C)],
-                "value": [value],
-                "value_unit": ["INP_per_mL_suspension"],
-                "basis": ["suspension"],
-                "lower_ci": [lower_error],
-                "upper_ci": [upper_error],
-                "dilution_fold": [dilution_fold],
-                "qc_flag": [0 if finite else 1],
-            }
-        )
-        copy_temperature_metadata(group_df.iloc[[0]], out)
-        frames.append(out)
+        if not group_result.empty:
+            frames.append(group_result)
 
     result = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if result.empty:
@@ -718,8 +689,6 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
             metadata=output_metadata,
         )
     result = result.sort_values(["sample_id", "temperature_C"], ascending=[True, False])
-    if enforce_monotone:
-        result = _enforce_monotone_cumulative_dataframe(result)
     return CumulativeNucleusSpectrumTable.from_dataframe(
         result,
         value_unit="INP_per_mL_suspension",
@@ -871,6 +840,163 @@ def normalize_inp_by_metadata(
             "dry_soil",
         )
     return np.array(inp_per_mL, dtype=float, copy=True), "INP_per_mL_suspension", "suspension"
+
+
+def _independent_mle_cumulative_group(
+    group_df: pd.DataFrame,
+    group_id: str,
+    metadata_by_sample_id: dict[str, SampleMetadata],
+    *,
+    confidence_drop: float,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    group_df = group_df.sort_values("temperature_C", ascending=False)
+    for temperature_C, temperature_df in group_df.groupby("temperature_C", sort=False):
+        value, lower_error, upper_error, finite, dilution_fold = _mle_fit_for_rows(
+            temperature_df,
+            group_id,
+            metadata_by_sample_id,
+            confidence_drop=confidence_drop,
+        )
+        rows.append(
+            _mle_result_row(
+                group_id,
+                float(temperature_C),
+                value,
+                lower_error,
+                upper_error,
+                dilution_fold,
+                0 if finite else 1,
+                temperature_df.iloc[0],
+            )
+        )
+    return pd.DataFrame.from_records(rows)
+
+
+def _constrained_mle_cumulative_group(
+    group_df: pd.DataFrame,
+    group_id: str,
+    metadata_by_sample_id: dict[str, SampleMetadata],
+    *,
+    confidence_drop: float,
+) -> pd.DataFrame:
+    blocks: list[dict[str, Any]] = []
+    group_df = group_df.sort_values("temperature_C", ascending=False)
+    for _, temperature_df in group_df.groupby("temperature_C", sort=False):
+        blocks.append(
+            _mle_block(
+                [temperature_df],
+                group_id,
+                metadata_by_sample_id,
+                confidence_drop=confidence_drop,
+            )
+        )
+        while len(blocks) >= 2 and blocks[-2]["value"] > blocks[-1]["value"]:
+            merged_frames = blocks[-2]["frames"] + blocks[-1]["frames"]
+            blocks[-2:] = [
+                _mle_block(
+                    merged_frames,
+                    group_id,
+                    metadata_by_sample_id,
+                    confidence_drop=confidence_drop,
+                )
+            ]
+
+    rows: list[dict[str, Any]] = []
+    for block in blocks:
+        qc_flag = (0 if block["finite"] else 1) | (2 if len(block["frames"]) > 1 else 0)
+        for temperature_df in block["frames"]:
+            temperature_C = float(temperature_df["temperature_C"].iloc[0])
+            rows.append(
+                _mle_result_row(
+                    group_id,
+                    temperature_C,
+                    block["value"],
+                    block["lower_error"],
+                    block["upper_error"],
+                    block["dilution_fold"],
+                    qc_flag,
+                    temperature_df.iloc[0],
+                )
+            )
+    return pd.DataFrame.from_records(rows)
+
+
+def _mle_block(
+    temperature_frames: list[pd.DataFrame],
+    group_id: str,
+    metadata_by_sample_id: dict[str, SampleMetadata],
+    *,
+    confidence_drop: float,
+) -> dict[str, Any]:
+    block_df = pd.concat(temperature_frames, ignore_index=True)
+    value, lower_error, upper_error, finite, dilution_fold = _mle_fit_for_rows(
+        block_df,
+        group_id,
+        metadata_by_sample_id,
+        confidence_drop=confidence_drop,
+    )
+    return {
+        "frames": temperature_frames,
+        "value": value,
+        "lower_error": lower_error,
+        "upper_error": upper_error,
+        "finite": finite,
+        "dilution_fold": dilution_fold,
+    }
+
+
+def _mle_fit_for_rows(
+    fit_df: pd.DataFrame,
+    group_id: str,
+    metadata_by_sample_id: dict[str, SampleMetadata],
+    *,
+    confidence_drop: float,
+) -> tuple[float, float, float, bool, float]:
+    if fit_df.empty:
+        return np.nan, np.nan, np.nan, False, np.nan
+
+    fit_sample_ids = fit_df["source_sample_id"].astype(str).to_numpy(copy=True)
+    fit_metadata = [metadata_by_sample_id[sample_id] for sample_id in fit_sample_ids]
+    well_volume_uL = _shared_well_volume_uL(fit_metadata, group_id)
+    dilution = np.array([metadata.dilution or 0.0 for metadata in fit_metadata], dtype=float)
+    if np.any(dilution <= 0):
+        raise ValueError(f"All dilutions must be positive for MLE group {group_id!r}")
+
+    value, lower_error, upper_error, finite = binomial_poisson_mle_with_profile_errors(
+        fit_df["n_frozen"].to_numpy(dtype=float, copy=True),
+        fit_df["n_total"].to_numpy(dtype=float, copy=True),
+        well_volume_uL,
+        dilution,
+        confidence_drop=confidence_drop,
+    )
+    dilution_fold = dilution[0] if len(pd.unique(dilution)) == 1 else np.nan
+    return value, lower_error, upper_error, finite, dilution_fold
+
+
+def _mle_result_row(
+    group_id: str,
+    temperature_C: float,
+    value: float,
+    lower_error: float,
+    upper_error: float,
+    dilution_fold: float,
+    qc_flag: int,
+    source_row: pd.Series,
+) -> dict[str, Any]:
+    out = {
+        "sample_id": group_id,
+        "temperature_C": temperature_C,
+        "value": value,
+        "value_unit": "INP_per_mL_suspension",
+        "basis": "suspension",
+        "lower_ci": lower_error,
+        "upper_ci": upper_error,
+        "dilution_fold": dilution_fold,
+        "qc_flag": qc_flag,
+    }
+    _copy_temperature_row_metadata(source_row, out)
+    return out
 
 
 def _normalize_metadata_mapping(metadata: MetadataLike) -> dict[str, SampleMetadata]:
@@ -1174,29 +1300,6 @@ def _enforce_monotone_stitch_result(result: pd.DataFrame) -> None:
             result.at[index, "qc_flag"] = int(result.at[index, "qc_flag"]) | 2
         previous_value = result.at[index, "value"]
         previous_upper_ci = result.at[index, "upper_ci"]
-
-
-def _enforce_monotone_cumulative_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.copy()
-    for _, group_index in result.groupby("sample_id", sort=False).groups.items():
-        ordered_index = result.loc[group_index].sort_values(
-            "temperature_C",
-            ascending=False,
-        ).index
-        previous_value = np.nan
-        previous_upper_ci = np.nan
-        for index in ordered_index:
-            value = result.at[index, "value"]
-            if not np.isfinite(value):
-                continue
-            if np.isfinite(previous_value) and value < previous_value:
-                current_upper_ci = result.at[index, "upper_ci"]
-                result.at[index, "value"] = previous_value
-                result.at[index, "upper_ci"] = _rms_pair(current_upper_ci, previous_upper_ci)
-                result.at[index, "qc_flag"] = int(result.at[index, "qc_flag"]) | 2
-            previous_value = result.at[index, "value"]
-            previous_upper_ci = result.at[index, "upper_ci"]
-    return result
 
 
 def _stitch_row_from_result(

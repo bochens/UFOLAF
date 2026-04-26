@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import csv
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -10,10 +11,46 @@ import pandas as pd
 from ufolaf_models import CountsTable, SampleMetadata, TemperatureFrozenFractionTable
 
 
+CountInputFormat = Literal["auto", "long", "canonical", "icescopy", "icescopy_wide", "wide"]
+CountColumn = Literal[
+    "sample_id",
+    "temperature_C",
+    "n_total",
+    "n_frozen",
+    "time_s",
+    "cycle",
+    "observation_id",
+]
+CountColumnMap = dict[CountColumn, str]
+LONG_COUNT_COLUMNS = {"sample_id", "temperature_C", "n_total", "n_frozen"}
+
+__all__ = [
+    "infer_dilution_groups",
+    "infer_icescopy_dilution_group_map",
+    "map_count_columns",
+    "metadata_frame",
+    "parse_icescopy_wide_temperature_sync",
+    "parse_olaf_frozen_at_temp",
+    "parse_olaf_frozen_at_temp_csv",
+    "parse_sync_wide",
+    "read_counts",
+    "read_commented_preamble",
+    "read_icescopy_freeze_count_timeseries_csv",
+    "read_icescopy_sample_metadata",
+    "read_icescopy_temperature_sync_csv",
+    "read_metadata",
+    "read_preamble",
+    "read_sync",
+    "sample_metadata_to_dataframe",
+    "split_metadata_rows",
+    "strip_temperature_sync_metadata_rows",
+]
+
 SAMPLE_VALUE_RE = re.compile(r"^(?P<sample>.+?)\s+number\s+(?P<kind>total|frozen)$")
 SAMPLE_HEADER_RE = re.compile(r"^(?P<sample>.+?)\s+\(n=(?P<n>[^)]+)\)$")
 METADATA_ROW_LABELS = {
     "sample_id",
+    "cell_number",
     "sample_name",
     "sample_long_name",
     "collection_start",
@@ -28,8 +65,8 @@ METADATA_ROW_LABELS = {
 }
 
 
-def read_commented_preamble(path: str | Path) -> dict[str, str]:
-    """Read leading '# key: value' preamble lines from a CSV file."""
+def read_preamble(path: str | Path) -> dict[str, str]:
+    """Read leading '# key: value' session preamble lines from a CSV file."""
 
     preamble: dict[str, str] = {}
     with Path(path).open("r", encoding="utf-8") as handle:
@@ -37,21 +74,23 @@ def read_commented_preamble(path: str | Path) -> dict[str, str]:
             if not line.startswith("#"):
                 break
             body = line[1:].strip()
+            if _is_sample_metadata_row(body):
+                continue
             if ":" in body:
                 key, value = body.split(":", 1)
                 preamble[key.strip()] = value.strip()
     return preamble
 
 
-def read_icescopy_temperature_sync_csv(path: str | Path) -> tuple[pd.DataFrame, dict[str, str]]:
+def read_sync(path: str | Path) -> tuple[pd.DataFrame, dict[str, str]]:
     """Read an Icescopy temperature-sync CSV with optional commented preamble."""
 
-    preamble = read_commented_preamble(path)
+    preamble = read_preamble(path)
     df = pd.read_csv(path, comment="#")
     return df, preamble
 
 
-def read_icescopy_sample_metadata(
+def read_metadata(
     path: str | Path,
 ) -> tuple[dict[str, str], dict[str, SampleMetadata]]:
     """Read Icescopy commented session/sample metadata from a freeze-count CSV."""
@@ -63,13 +102,14 @@ def read_icescopy_sample_metadata(
             if not line.startswith("#"):
                 break
             body = line[1:].strip()
+            if _is_sample_metadata_row(body):
+                values = _split_csv_metadata_row(body)
+                sample_rows[values[0]] = values[1:]
+                continue
             if ":" in body:
                 key, value = body.split(":", 1)
                 session_metadata[key.strip()] = value.strip()
                 continue
-            if "," in body:
-                values = [value.strip() for value in body.split(",")]
-                sample_rows[values[0]] = values[1:]
 
     metadata_by_sample_id: dict[str, SampleMetadata] = {}
     row_count = max((len(values) for values in sample_rows.values()), default=0)
@@ -103,18 +143,40 @@ def read_icescopy_sample_metadata(
             filter_fraction_used=raw_sample_metadata.get("filter_fraction_used"),
             suspension_volume_mL=raw_sample_metadata.get("suspension_volume_mL"),
             dry_mass_g=raw_sample_metadata.get("dry_mass_g"),
+            total_cells=raw_sample_metadata.get("cell_number"),
             raw_preamble=session_metadata,
             raw_sample_metadata=raw_sample_metadata,
         )
     return session_metadata, metadata_by_sample_id
 
 
-def read_icescopy_freeze_count_timeseries_csv(path: str | Path) -> CountsTable:
-    """Read an Icescopy freeze_count_timeseries CSV as a CountsTable with metadata."""
+def read_counts(
+    source: str | Path | pd.DataFrame,
+    *,
+    format: CountInputFormat = "auto",
+    columns: CountColumnMap | None = None,
+    metadata: dict[str, SampleMetadata] | None = None,
+) -> CountsTable:
+    """Read count observations into a CountsTable.
 
-    df, _ = read_icescopy_temperature_sync_csv(path)
-    counts = parse_icescopy_wide_temperature_sync(df)
-    _, metadata = read_icescopy_sample_metadata(path)
+    Supported inputs:
+    - canonical long tables with sample_id, temperature_C, n_total, n_frozen
+    - arbitrary long tables with a user-supplied columns mapping
+    - Icescopy wide freeze_count_timeseries exports with "number total/frozen" columns
+    """
+
+    df = source.copy() if isinstance(source, pd.DataFrame) else read_sync(source)[0]
+    if columns is not None:
+        mapped_df = map_count_columns(df, columns)
+        return CountsTable.from_dataframe(mapped_df, metadata=metadata or _metadata_from_path(source))
+
+    resolved_format = _resolve_counts_format(df, format)
+
+    if resolved_format == "long":
+        return CountsTable.from_dataframe(df, metadata=metadata or _metadata_from_path(source))
+
+    counts = parse_sync_wide(df)
+    metadata_by_sample = metadata or _metadata_from_path(source)
     return CountsTable(
         sample_id=counts.sample_id,
         temperature_C=counts.temperature_C,
@@ -123,11 +185,30 @@ def read_icescopy_freeze_count_timeseries_csv(path: str | Path) -> CountsTable:
         time_s=counts.time_s,
         cycle=counts.cycle,
         observation_id=counts.observation_id,
-        metadata=metadata,
+        metadata=metadata_by_sample,
     )
 
 
-def sample_metadata_to_dataframe(
+def map_count_columns(df: pd.DataFrame, columns: CountColumnMap) -> pd.DataFrame:
+    """Map an arbitrary long count table into UFOLAF's canonical column names."""
+
+    unknown = sorted(set(columns) - _count_column_names())
+    if unknown:
+        raise ValueError(f"Unknown canonical count columns: {', '.join(unknown)}")
+    required = {"sample_id", "temperature_C", "n_total", "n_frozen"}
+    missing_required = sorted(required - set(columns))
+    if missing_required:
+        raise ValueError(f"Column mapping is missing: {', '.join(missing_required)}")
+    missing_input = sorted({source for source in columns.values() if source not in df.columns})
+    if missing_input:
+        raise ValueError(f"Input table is missing mapped columns: {', '.join(missing_input)}")
+
+    renamed = {source: target for target, source in columns.items()}
+    mapped = df[list(columns.values())].rename(columns=renamed)
+    return mapped.loc[:, [column for column in _ordered_count_columns() if column in mapped]]
+
+
+def metadata_frame(
     metadata_by_sample_id: dict[str, SampleMetadata],
 ) -> pd.DataFrame:
     """Return sample metadata as a human-readable DataFrame."""
@@ -151,7 +232,7 @@ def sample_metadata_to_dataframe(
     )
 
 
-def infer_icescopy_dilution_group_map(
+def infer_dilution_groups(
     metadata_by_sample_id: dict[str, SampleMetadata],
 ) -> dict[str, str]:
     """Infer parent sample IDs from Icescopy long names like CRG_M1_13."""
@@ -164,7 +245,7 @@ def infer_icescopy_dilution_group_map(
     }
 
 
-def strip_temperature_sync_metadata_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def split_metadata_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Split sample metadata rows from temperature-sync data rows."""
 
     if df.empty:
@@ -177,10 +258,11 @@ def strip_temperature_sync_metadata_rows(df: pd.DataFrame) -> tuple[pd.DataFrame
     return data_rows.reset_index(drop=True), metadata_rows.reset_index(drop=True)
 
 
-def parse_icescopy_wide_temperature_sync(df: pd.DataFrame) -> CountsTable:
+def parse_sync_wide(df: pd.DataFrame) -> CountsTable:
     """Convert an Icescopy wide temperature-sync table into a CountsTable."""
 
-    data_rows, _ = strip_temperature_sync_metadata_rows(df)
+    data_rows, _ = split_metadata_rows(df)
+    time_s = _time_seconds(data_rows)
     sample_columns: dict[str, dict[str, str]] = {}
     for column in data_rows.columns:
         match = SAMPLE_VALUE_RE.match(str(column))
@@ -204,7 +286,7 @@ def parse_icescopy_wide_temperature_sync(df: pd.DataFrame) -> CountsTable:
                 {
                     "sample_id": sample_id,
                     "temperature_C": _to_float_or_nan(row.get("temperature_C", np.nan)),
-                    "time_s": row_index,
+                    "time_s": time_s[row_index],
                     "n_total": total,
                     "n_frozen": frozen,
                     "cycle": row.get("cycle", np.nan),
@@ -214,6 +296,99 @@ def parse_icescopy_wide_temperature_sync(df: pd.DataFrame) -> CountsTable:
     if not records:
         raise ValueError("No sample number total/frozen column pairs found")
     return CountsTable.from_dataframe(pd.DataFrame.from_records(records))
+
+
+def _is_sample_metadata_row(body: str) -> bool:
+    if "," not in body:
+        return False
+    key = _split_csv_metadata_row(body)[0]
+    return key in METADATA_ROW_LABELS
+
+
+def _split_csv_metadata_row(body: str) -> list[str]:
+    return [value.strip() for value in next(csv.reader([body]))]
+
+
+def _time_seconds(df: pd.DataFrame) -> np.ndarray:
+    if "time_s" in df:
+        return pd.to_numeric(df["time_s"], errors="coerce").to_numpy(dtype=float)
+    if "timestamp" not in df:
+        return np.arange(len(df), dtype=float)
+    timestamp = pd.to_datetime(df["timestamp"], errors="coerce")
+    if timestamp.notna().sum() == 0:
+        return np.arange(len(df), dtype=float)
+    start = timestamp.dropna().iloc[0]
+    elapsed = (timestamp - start).dt.total_seconds()
+    return elapsed.fillna(np.nan).to_numpy(dtype=float)
+
+
+def _metadata_from_path(source: str | Path | pd.DataFrame) -> dict[str, SampleMetadata]:
+    if isinstance(source, pd.DataFrame):
+        return {}
+    _, metadata = read_metadata(source)
+    return metadata
+
+
+def _count_column_names() -> set[str]:
+    return set(_ordered_count_columns())
+
+
+def _ordered_count_columns() -> tuple[str, ...]:
+    return (
+        "sample_id",
+        "temperature_C",
+        "n_total",
+        "n_frozen",
+        "time_s",
+        "cycle",
+        "observation_id",
+    )
+
+
+def _resolve_counts_format(df: pd.DataFrame, format: CountInputFormat) -> Literal["long", "wide"]:
+    normalized = format.casefold()
+    if normalized in ("long", "canonical"):
+        _require_long_count_columns(df)
+        return "long"
+    if normalized in ("icescopy", "icescopy_wide", "wide"):
+        _require_wide_count_columns(df)
+        return "wide"
+    if normalized != "auto":
+        raise ValueError("format must be one of auto, long, canonical, icescopy, icescopy_wide, wide")
+    if _has_long_count_columns(df):
+        return "long"
+    if _has_wide_count_columns(df):
+        return "wide"
+    raise ValueError(
+        "Could not detect counts input format. Supported formats are canonical long "
+        "columns (sample_id, temperature_C, n_total, n_frozen) or Icescopy wide "
+        "'number total'/'number frozen' column pairs."
+    )
+
+
+def _has_long_count_columns(df: pd.DataFrame) -> bool:
+    return LONG_COUNT_COLUMNS.issubset(set(df.columns))
+
+
+def _require_long_count_columns(df: pd.DataFrame) -> None:
+    missing = sorted(LONG_COUNT_COLUMNS - set(df.columns))
+    if missing:
+        raise ValueError(f"Long count table is missing required columns: {', '.join(missing)}")
+
+
+def _has_wide_count_columns(df: pd.DataFrame) -> bool:
+    sample_columns: dict[str, set[str]] = {}
+    for column in df.columns:
+        match = SAMPLE_VALUE_RE.match(str(column))
+        if not match:
+            continue
+        sample_columns.setdefault(match.group("sample").strip(), set()).add(match.group("kind"))
+    return any({"total", "frozen"}.issubset(kinds) for kinds in sample_columns.values())
+
+
+def _require_wide_count_columns(df: pd.DataFrame) -> None:
+    if not _has_wide_count_columns(df):
+        raise ValueError("Icescopy wide table must include number total/frozen column pairs")
 
 
 def _sample_id_from_header(sample_key: str) -> str:
@@ -241,7 +416,7 @@ def _strip_trailing_numeric_token(value: str) -> str:
     return parts[0]
 
 
-def parse_olaf_frozen_at_temp_csv(
+def parse_olaf_frozen_at_temp(
     df: pd.DataFrame,
     *,
     n_total_by_sample: dict[str, float],
@@ -275,3 +450,14 @@ def parse_olaf_frozen_at_temp_csv(
         n_total=result["n_total"].to_numpy(dtype=float),
         n_frozen=result["n_frozen"].to_numpy(dtype=float),
     )
+
+
+read_commented_preamble = read_preamble
+read_icescopy_temperature_sync_csv = read_sync
+read_icescopy_sample_metadata = read_metadata
+read_icescopy_freeze_count_timeseries_csv = read_counts
+sample_metadata_to_dataframe = metadata_frame
+infer_icescopy_dilution_group_map = infer_dilution_groups
+strip_temperature_sync_metadata_rows = split_metadata_rows
+parse_icescopy_wide_temperature_sync = parse_sync_wide
+parse_olaf_frozen_at_temp_csv = parse_olaf_frozen_at_temp
