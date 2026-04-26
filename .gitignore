@@ -164,6 +164,8 @@ cython_debug/
 /tests/test_data/capek/
 
 # Local/unpackaged development artifacts
+.pre-commit-config.yaml
+uv.lock
 docs/
 tests/
 olaf/
