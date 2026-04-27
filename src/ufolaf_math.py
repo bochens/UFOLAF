@@ -107,6 +107,28 @@ def bin_temperature(values: Any, step_C: float = 0.5) -> np.ndarray:
     return np.round(as_float_array(values, name="temperature_C") / step_C) * step_C
 
 
+def temperature_thresholds(values: Any, step_C: float = 0.5) -> np.ndarray:
+    """Return regular cold-threshold temperatures crossed by observations.
+
+    A threshold row labeled ``T`` represents the cumulative state when cooling
+    has reached/passed ``T``. For example, with ``step_C=0.5``, a row labeled
+    ``-7.5`` represents the state at the cold end of the interval ``(-7.0,
+    -7.5]`` rather than a bin centered at ``-7.5``.
+    """
+
+    if step_C <= 0:
+        raise ValueError("step_C must be positive")
+    temperatures = as_float_array(values, name="temperature_C")
+    finite = temperatures[np.isfinite(temperatures)]
+    if finite.size == 0:
+        return np.array([], dtype=float)
+    warm = np.floor(np.max(finite) / step_C) * step_C
+    cold = np.ceil(np.min(finite) / step_C) * step_C
+    if warm < cold:
+        return np.array([], dtype=float)
+    return temperature_grid(cold, warm, step_C)
+
+
 def temperature_grid(
     min_temperature_C: float,
     max_temperature_C: float,
@@ -133,6 +155,18 @@ def temperature_bin_edges(
     temps = as_float_array(temperature_C, name="temperature_C")
     half_step = step_C / 2.0
     return temps - half_step, temps + half_step
+
+
+def temperature_threshold_edges(
+    temperature_C: Any,
+    step_C: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return cold/warm interval edges for threshold-labeled temperatures."""
+
+    if step_C <= 0:
+        raise ValueError("step_C must be positive")
+    temps = as_float_array(temperature_C, name="temperature_C")
+    return temps, temps + step_C
 
 
 def agresti_coull_fraction_ci(
@@ -466,7 +500,13 @@ def differential_inp_per_ml_per_c_from_counts(
     temperature_bin_width_C: float,
     dilution: Any = 1.0,
 ) -> np.ndarray:
-    """Return differential nucleus spectrum k(T), expressed as INP/mL/C."""
+    """Return Vali differential nucleus spectrum k(T), expressed as INP/mL/C.
+
+    ``temperature_bin_width_C`` is Vali's finite temperature interval ``Delta T``.
+    For threshold rows, ``delta_frozen`` is the number of wells newly frozen in
+    the interval ending at that threshold, and ``unfrozen_before_bin`` is N(T) at
+    the warm side of the interval.
+    """
 
     frozen = as_float_array(n_frozen, name="n_frozen")
     total = as_float_array(n_total, name="n_total")
@@ -478,8 +518,14 @@ def differential_inp_per_ml_per_c_from_counts(
     previous_frozen = np.r_[0.0, frozen[:-1]]
     delta_frozen = frozen - previous_frozen
     unfrozen_before_bin = total - previous_frozen
+    valid_interval = (
+        (unfrozen_before_bin > 0)
+        & (delta_frozen >= 0)
+        & (delta_frozen <= unfrozen_before_bin)
+    )
     with np.errstate(divide="ignore", invalid="ignore"):
         fraction_freezing_in_bin = delta_frozen / unfrozen_before_bin
+    fraction_freezing_in_bin = np.where(valid_interval, fraction_freezing_in_bin, np.nan)
     return cumulative_inp_per_ml_from_fraction(
         fraction_freezing_in_bin,
         well_volume_uL,
@@ -654,7 +700,8 @@ def _binomial_poisson_score(
     occupancy_scale: np.ndarray,
 ) -> float:
     occupancy = inp_per_mL * occupancy_scale
-    denominator = np.expm1(occupancy)
+    with np.errstate(over="ignore"):
+        denominator = np.expm1(occupancy)
     frozen_term = np.zeros_like(frozen, dtype=float)
     frozen_mask = frozen != 0
     frozen_term[frozen_mask] = (

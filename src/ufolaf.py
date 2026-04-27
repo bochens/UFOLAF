@@ -13,16 +13,27 @@ from ufolaf_adapters import (
     read_counts,
     read_metadata,
     read_sync,
+    tables_to_dataframe,
 )
-from ufolaf_blank_math import average_blank_spectra, subtract_blank_spectrum
+from ufolaf_blank_math import (
+    average_blank_spectra,
+    extrapolate_blank_tail,
+    subtract_blank_spectrum,
+    subtract_filter_blank_spectrum,
+)
 from ufolaf_models import (
+    ArtifactRef,
     CountsTable,
     CumulativeNucleusSpectrumTable,
     DifferentialNucleusSpectrumTable,
     NormalizedInpSpectrumTable,
+    ProcessingMetadata,
+    ProcessingStep,
     SampleMetadata,
     TemperatureDependentTable,
     TemperatureFrozenFractionTable,
+    artifact_ref,
+    processing_metadata_for,
 )
 from ufolaf_qc import enforce_monotonic_vs_temperature
 from ufolaf_transforms import (
@@ -39,10 +50,14 @@ __all__ = [
     "CountsTable",
     "CumulativeNucleusSpectrumTable",
     "DifferentialNucleusSpectrumTable",
+    "ArtifactRef",
     "NormalizedInpSpectrumTable",
+    "ProcessingMetadata",
+    "ProcessingStep",
     "SampleMetadata",
     "TemperatureDependentTable",
     "TemperatureFrozenFractionTable",
+    "artifact_ref",
     "apply_water_blank",
     "average_blank_spectra",
     "cumulative_spec",
@@ -57,8 +72,12 @@ __all__ = [
     "normalize_spec",
     "parse_olaf_frozen_at_temp",
     "parse_sync_wide",
+    "processing_metadata_for",
     "read_counts",
     "read_metadata",
     "read_sync",
+    "subtract_filter_blank_spectrum",
     "subtract_blank_spectrum",
+    "extrapolate_blank_tail",
+    "tables_to_dataframe",
 ]

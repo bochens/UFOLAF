@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field, replace
+import hashlib
+import json
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 
 import numpy as np
@@ -180,6 +182,120 @@ class SampleMetadata:
 MetadataLike = SampleMetadata | dict[str, SampleMetadata] | None
 
 
+@dataclass(frozen=True)
+class ArtifactRef:
+    """Serializable reference to a UFOLAF table artifact."""
+
+    artifact_id: str
+    table_type: str
+    role: str = "predecessor"
+    sample_ids: tuple[str, ...] = ()
+    content_hash: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "artifact_id", _text_or_empty(self.artifact_id))
+        object.__setattr__(self, "table_type", _text_or_empty(self.table_type))
+        object.__setattr__(self, "role", _text_or_empty(self.role) or "predecessor")
+        object.__setattr__(self, "sample_ids", _string_tuple(self.sample_ids))
+        object.__setattr__(self, "content_hash", _text_or_empty(self.content_hash))
+
+
+@dataclass(frozen=True)
+class ProcessingStep:
+    """One lightweight provenance step in a UFOLAF processing chain."""
+
+    operation: str
+    parameters: dict[str, Any] = field(default_factory=dict)
+    inputs: tuple[ArtifactRef, ...] = ()
+    source_sample_ids: tuple[str, ...] = ()
+    source_cycles: tuple[str, ...] = ()
+    source_dilutions: tuple[Any, ...] = ()
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "operation", _text_or_empty(self.operation))
+        object.__setattr__(self, "parameters", _plain_mapping(self.parameters))
+        object.__setattr__(self, "inputs", tuple(copy.deepcopy(self.inputs or ())))
+        object.__setattr__(self, "source_sample_ids", _string_tuple(self.source_sample_ids))
+        object.__setattr__(self, "source_cycles", _string_tuple(self.source_cycles))
+        object.__setattr__(self, "source_dilutions", _plain_tuple(self.source_dilutions))
+        object.__setattr__(self, "details", _plain_mapping(self.details))
+
+
+@dataclass(frozen=True)
+class ProcessingMetadata:
+    """Provenance for one table: current step plus lightweight history."""
+
+    artifact_id: str = ""
+    generated_by: ProcessingStep | None = None
+    history_snapshot: tuple[ProcessingStep, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "artifact_id", _text_or_empty(self.artifact_id))
+        object.__setattr__(
+            self,
+            "generated_by",
+            copy.deepcopy(self.generated_by) if self.generated_by is not None else None,
+        )
+        object.__setattr__(
+            self,
+            "history_snapshot",
+            tuple(copy.deepcopy(self.history_snapshot or ())),
+        )
+
+
+def artifact_ref(table: Any, *, role: str = "predecessor") -> ArtifactRef:
+    """Return a stable lightweight reference for a UFOLAF table."""
+
+    processing = getattr(table, "processing_metadata", ProcessingMetadata())
+    content_hash = _table_content_hash(table)
+    artifact_id = processing.artifact_id or f"{type(table).__name__}:{content_hash[:16]}"
+    sample_ids = tuple(pd.Series(table.sample_id).astype(str).dropna().unique())
+    return ArtifactRef(
+        artifact_id=artifact_id,
+        table_type=type(table).__name__,
+        role=role,
+        sample_ids=sample_ids,
+        content_hash=content_hash,
+    )
+
+
+def processing_metadata_for(
+    operation: str,
+    *,
+    inputs: tuple[Any, ...] | list[Any] = (),
+    parameters: dict[str, Any] | None = None,
+    source_sample_ids: tuple[str, ...] | list[str] = (),
+    source_cycles: tuple[str, ...] | list[str] = (),
+    source_dilutions: tuple[Any, ...] | list[Any] = (),
+    details: dict[str, Any] | None = None,
+) -> ProcessingMetadata:
+    """Build processing metadata from immediate predecessor tables or refs."""
+
+    input_refs: list[ArtifactRef] = []
+    history: list[ProcessingStep] = []
+    for value in inputs:
+        if isinstance(value, ArtifactRef):
+            input_refs.append(value)
+            continue
+        input_refs.append(artifact_ref(value))
+        processing = getattr(value, "processing_metadata", None)
+        if isinstance(processing, ProcessingMetadata):
+            history.extend(processing.history_snapshot)
+
+    step = ProcessingStep(
+        operation=operation,
+        parameters=parameters or {},
+        inputs=tuple(input_refs),
+        source_sample_ids=tuple(source_sample_ids),
+        source_cycles=tuple(source_cycles),
+        source_dilutions=tuple(source_dilutions),
+        details=details or {},
+    )
+    history.append(step)
+    return ProcessingMetadata(generated_by=step, history_snapshot=tuple(history))
+
+
 def _normalize_metadata(metadata: MetadataLike) -> MetadataLike:
     if metadata is None or isinstance(metadata, SampleMetadata):
         return copy.deepcopy(metadata)
@@ -193,12 +309,85 @@ def _normalize_metadata(metadata: MetadataLike) -> MetadataLike:
     return copy.deepcopy(metadata)
 
 
+def _normalize_processing_metadata(
+    processing_metadata: ProcessingMetadata | None,
+) -> ProcessingMetadata:
+    if processing_metadata is None:
+        return ProcessingMetadata()
+    if not isinstance(processing_metadata, ProcessingMetadata):
+        raise TypeError("processing_metadata must be a ProcessingMetadata object or None")
+    return copy.deepcopy(processing_metadata)
+
+
 def _metadata_for_sample(metadata: MetadataLike, sample_id: str) -> SampleMetadata | None:
     if metadata is None:
         return None
     if isinstance(metadata, SampleMetadata):
         return metadata
     return metadata.get(sample_id)
+
+
+def _string_tuple(values: Any) -> tuple[str, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, str):
+        return (values,)
+    return tuple(_text_or_empty(value) for value in values)
+
+
+def _plain_tuple(values: Any) -> tuple[Any, ...]:
+    if values is None:
+        return ()
+    if isinstance(values, (str, bytes)):
+        return (values,)
+    return tuple(_plain_value(value) for value in values)
+
+
+def _plain_mapping(values: dict[str, Any] | None) -> dict[str, Any]:
+    if values is None:
+        return {}
+    return {str(key): _plain_value(value) for key, value in values.items()}
+
+
+def _plain_value(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return [_plain_value(item) for item in value.tolist()]
+    if isinstance(value, (list, tuple)):
+        return [_plain_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _plain_value(item) for key, item in value.items()}
+    return value
+
+
+def _table_content_hash(table: Any) -> str:
+    payload = {
+        "table_type": type(table).__name__,
+        "data": table.to_dataframe().to_dict(orient="list"),
+        "sample_metadata": _metadata_hash_payload(getattr(table, "metadata", None)),
+    }
+    encoded = json.dumps(_plain_value(payload), sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _metadata_hash_payload(metadata: MetadataLike) -> Any:
+    if metadata is None:
+        return None
+    if isinstance(metadata, SampleMetadata):
+        return asdict(metadata)
+    return {str(key): asdict(value) for key, value in sorted(metadata.items())}
+
+
+def _dataframe_like_getitem(table: Any, key: Any) -> Any:
+    return table.to_dataframe().__getitem__(key)
+
+
+def _dataframe_like_to_numpy(table: Any, columns: list[str] | tuple[str, ...] | None) -> np.ndarray:
+    df = table.to_dataframe()
+    if columns is not None:
+        df = df.loc[:, list(columns)]
+    return df.to_numpy(copy=True)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -213,6 +402,7 @@ class CountsTable:
     cycle: Any | None = None
     observation_id: Any | None = None
     metadata: MetadataLike = None
+    processing_metadata: ProcessingMetadata | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -235,6 +425,11 @@ class CountsTable:
             self, "observation_id", _optional_array(self.observation_id, dtype=object)
         )
         object.__setattr__(self, "metadata", _normalize_metadata(self.metadata))
+        object.__setattr__(
+            self,
+            "processing_metadata",
+            _normalize_processing_metadata(self.processing_metadata),
+        )
         lengths = {
             "sample_id": len(self.sample_id),
             "temperature_C": len(self.temperature_C),
@@ -253,7 +448,13 @@ class CountsTable:
             return self.n_frozen / self.n_total
 
     @classmethod
-    def from_dataframe(cls, df: pd.DataFrame, *, metadata: MetadataLike = None) -> CountsTable:
+    def from_dataframe(
+        cls,
+        df: pd.DataFrame,
+        *,
+        metadata: MetadataLike = None,
+        processing_metadata: ProcessingMetadata | None = None,
+    ) -> CountsTable:
         return cls(
             sample_id=df["sample_id"].to_numpy(dtype=object),
             temperature_C=df["temperature_C"].to_numpy(dtype=float),
@@ -265,7 +466,28 @@ class CountsTable:
             if "observation_id" in df
             else None,
             metadata=metadata,
+            processing_metadata=processing_metadata,
         )
+
+    @property
+    def sample_metadata(self) -> MetadataLike:
+        return self.metadata
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return tuple(self.to_dataframe().columns)
+
+    def __len__(self) -> int:
+        return len(self.sample_id)
+
+    def __getitem__(self, key: Any) -> Any:
+        return _dataframe_like_getitem(self, key)
+
+    def to_numpy(self, columns: list[str] | tuple[str, ...] | None = None) -> np.ndarray:
+        return _dataframe_like_to_numpy(self, columns)
+
+    def artifact_ref(self, *, role: str = "predecessor") -> ArtifactRef:
+        return artifact_ref(self, role=role)
 
     def to_dataframe(self) -> pd.DataFrame:
         data: dict[str, Any] = {
@@ -298,6 +520,7 @@ class TemperatureDependentTable:
     temperature_bin_left_C: Any | None = None
     temperature_bin_right_C: Any | None = None
     metadata: MetadataLike = None
+    processing_metadata: ProcessingMetadata | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -319,6 +542,11 @@ class TemperatureDependentTable:
             _optional_array(self.temperature_bin_right_C, dtype=float),
         )
         object.__setattr__(self, "metadata", _normalize_metadata(self.metadata))
+        object.__setattr__(
+            self,
+            "processing_metadata",
+            _normalize_processing_metadata(self.processing_metadata),
+        )
         if self.temperature_bin_width_C is not None and self.temperature_bin_width_C <= 0:
             raise ValueError("temperature_bin_width_C must be positive")
         lengths = {
@@ -350,6 +578,26 @@ class TemperatureDependentTable:
 
     def metadata_for_sample(self, sample_id: str) -> SampleMetadata | None:
         return _metadata_for_sample(self.metadata, sample_id)
+
+    @property
+    def sample_metadata(self) -> MetadataLike:
+        return self.metadata
+
+    @property
+    def columns(self) -> tuple[str, ...]:
+        return tuple(self.to_dataframe().columns)
+
+    def __len__(self) -> int:
+        return len(self.sample_id)
+
+    def __getitem__(self, key: Any) -> Any:
+        return _dataframe_like_getitem(self, key)
+
+    def to_numpy(self, columns: list[str] | tuple[str, ...] | None = None) -> np.ndarray:
+        return _dataframe_like_to_numpy(self, columns)
+
+    def artifact_ref(self, *, role: str = "predecessor") -> ArtifactRef:
+        return artifact_ref(self, role=role)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -402,6 +650,7 @@ class TemperatureFrozenFractionTable(TemperatureDependentTable):
         temperature_bin_width_C: float | None = None,
         temperature_bin_method: str = "",
         metadata: MetadataLike = None,
+        processing_metadata: ProcessingMetadata | None = None,
     ) -> TemperatureFrozenFractionTable:
         return cls(
             sample_id=df["sample_id"].to_numpy(dtype=object),
@@ -421,6 +670,7 @@ class TemperatureFrozenFractionTable(TemperatureDependentTable):
             n_frozen=df["n_frozen"].to_numpy(dtype=float),
             obs_count=df["obs_count"].to_numpy(dtype=int) if "obs_count" in df else None,
             metadata=metadata,
+            processing_metadata=processing_metadata,
         )
 
 
@@ -489,6 +739,7 @@ class CumulativeNucleusSpectrumTable(TemperatureDependentTable):
         value_unit: str | None = None,
         basis: SpectrumBasis | Any = "suspension",
         metadata: MetadataLike = None,
+        processing_metadata: ProcessingMetadata | None = None,
     ) -> CumulativeNucleusSpectrumTable:
         return cls(
             **_temperature_kwargs_from_dataframe(df),
@@ -502,6 +753,7 @@ class CumulativeNucleusSpectrumTable(TemperatureDependentTable):
             else None,
             qc_flag=df["qc_flag"].to_numpy(dtype=int) if "qc_flag" in df else None,
             metadata=metadata,
+            processing_metadata=processing_metadata,
         )
 
 
@@ -512,10 +764,8 @@ class NormalizedInpSpectrumTable(TemperatureDependentTable):
     value: Any
     value_unit: str | Any
     basis: SpectrumBasis | Any
-    inp_per_mL: Any | None = None
     lower_ci: Any | None = None
     upper_ci: Any | None = None
-    dilution_fold: Any | None = None
     qc_flag: Any | None = None
     replicate_count: Any | None = None
     is_extrapolated: Any | None = None
@@ -526,10 +776,8 @@ class NormalizedInpSpectrumTable(TemperatureDependentTable):
         object.__setattr__(self, "basis", _normalize_spectrum_basis(self.basis))
         object.__setattr__(self, "value", _required_array(self.value, dtype=float, name="value"))
         object.__setattr__(self, "value_unit", _required_unit(self.value_unit, name="value_unit"))
-        object.__setattr__(self, "inp_per_mL", _optional_array(self.inp_per_mL, dtype=float))
         object.__setattr__(self, "lower_ci", _optional_array(self.lower_ci, dtype=float))
         object.__setattr__(self, "upper_ci", _optional_array(self.upper_ci, dtype=float))
-        object.__setattr__(self, "dilution_fold", _optional_array(self.dilution_fold, dtype=float))
         object.__setattr__(self, "qc_flag", _optional_array(self.qc_flag, dtype=int))
         object.__setattr__(
             self, "replicate_count", _optional_array(self.replicate_count, dtype=int)
@@ -540,8 +788,6 @@ class NormalizedInpSpectrumTable(TemperatureDependentTable):
         lengths = _spectrum_lengths(
             self,
             extra_names=(
-                "inp_per_mL",
-                "dilution_fold",
                 "replicate_count",
                 "is_extrapolated",
             ),
@@ -552,8 +798,6 @@ class NormalizedInpSpectrumTable(TemperatureDependentTable):
         data = _spectrum_dataframe(
             self,
             extra_names=(
-                "inp_per_mL",
-                "dilution_fold",
                 "replicate_count",
                 "is_extrapolated",
             ),
@@ -572,6 +816,7 @@ class NormalizedInpSpectrumTable(TemperatureDependentTable):
         basis: SpectrumBasis | Any | None = None,
         correction_state: str = "",
         metadata: MetadataLike = None,
+        processing_metadata: ProcessingMetadata | None = None,
     ) -> NormalizedInpSpectrumTable:
         inferred_basis = _basis_from_dataframe(df, basis if basis is not None else "other")
         inferred_correction = correction_state
@@ -583,12 +828,8 @@ class NormalizedInpSpectrumTable(TemperatureDependentTable):
             value=df["value"].to_numpy(dtype=float),
             value_unit=_value_unit_from_dataframe(df, value_unit),
             basis=inferred_basis,
-            inp_per_mL=df["inp_per_mL"].to_numpy(dtype=float) if "inp_per_mL" in df else None,
             lower_ci=df["lower_ci"].to_numpy(dtype=float) if "lower_ci" in df else None,
             upper_ci=df["upper_ci"].to_numpy(dtype=float) if "upper_ci" in df else None,
-            dilution_fold=df["dilution_fold"].to_numpy(dtype=float)
-            if "dilution_fold" in df
-            else None,
             qc_flag=df["qc_flag"].to_numpy(dtype=int) if "qc_flag" in df else None,
             replicate_count=df["replicate_count"].to_numpy(dtype=int)
             if "replicate_count" in df
@@ -598,6 +839,7 @@ class NormalizedInpSpectrumTable(TemperatureDependentTable):
             else None,
             correction_state=inferred_correction,
             metadata=metadata,
+            processing_metadata=processing_metadata,
         )
 
 

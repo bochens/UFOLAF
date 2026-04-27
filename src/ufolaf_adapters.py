@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import csv
 import re
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
 import pandas as pd
 
-from ufolaf_models import CountsTable, SampleMetadata, TemperatureFrozenFractionTable
+from ufolaf_models import (
+    CountsTable,
+    SampleMetadata,
+    TemperatureFrozenFractionTable,
+    processing_metadata_for,
+)
 
 
 CountInputFormat = Literal["auto", "long", "canonical", "icescopy", "icescopy_wide", "wide"]
+CountCyclePolicy = Literal["single", "pooled", "preserve"]
 CountColumn = Literal[
     "sample_id",
     "temperature_C",
@@ -23,6 +30,7 @@ CountColumn = Literal[
 ]
 CountColumnMap = dict[CountColumn, str]
 LONG_COUNT_COLUMNS = {"sample_id", "temperature_C", "n_total", "n_frozen"}
+SAMPLE_METADATA_FIELDS = {field.name for field in fields(SampleMetadata)}
 
 __all__ = [
     "infer_dilution_groups",
@@ -44,6 +52,7 @@ __all__ = [
     "sample_metadata_to_dataframe",
     "split_metadata_rows",
     "strip_temperature_sync_metadata_rows",
+    "tables_to_dataframe",
 ]
 
 SAMPLE_VALUE_RE = re.compile(r"^(?P<sample>.+?)\s+number\s+(?P<kind>total|frozen)$")
@@ -155,38 +164,40 @@ def read_counts(
     *,
     format: CountInputFormat = "auto",
     columns: CountColumnMap | None = None,
-    metadata: dict[str, SampleMetadata] | None = None,
-) -> CountsTable:
-    """Read count observations into a CountsTable.
+    metadata: Any = None,
+    cycle_policy: CountCyclePolicy = "single",
+    cycle: Any | None = None,
+) -> CountsTable | list[CountsTable] | dict[str, CountsTable | list[CountsTable]]:
+    """Read count observations into sample/dilution table(s).
 
     Supported inputs:
     - canonical long tables with sample_id, temperature_C, n_total, n_frozen
     - arbitrary long tables with a user-supplied columns mapping
     - Icescopy wide freeze_count_timeseries exports with "number total/frozen" columns
+    - optional metadata as SampleMetadata, dict[str, SampleMetadata],
+      dict[str, dict], metadata DataFrame, or a dict of common metadata defaults
+
+    ``cycle_policy="single"`` selects one cycle and returns a table or dilution
+    list. ``cycle_policy="pooled"`` marks all cycles for pooled threshold
+    reduction and returns a table or dilution list. ``cycle_policy="preserve"``
+    returns ``dict[cycle_id, table_or_dilution_list]``.
     """
 
     df = source.copy() if isinstance(source, pd.DataFrame) else read_sync(source)[0]
+    metadata_source = metadata if metadata is not None else _metadata_from_path(source)
     if columns is not None:
         mapped_df = map_count_columns(df, columns)
-        return CountsTable.from_dataframe(mapped_df, metadata=metadata or _metadata_from_path(source))
+        count_tables = _count_tables_from_long_dataframe(mapped_df, metadata_source)
+        return _apply_count_cycle_policy(count_tables, cycle_policy=cycle_policy, cycle=cycle)
 
     resolved_format = _resolve_counts_format(df, format)
 
     if resolved_format == "long":
-        return CountsTable.from_dataframe(df, metadata=metadata or _metadata_from_path(source))
+        count_tables = _count_tables_from_long_dataframe(df, metadata_source)
+        return _apply_count_cycle_policy(count_tables, cycle_policy=cycle_policy, cycle=cycle)
 
-    counts = parse_sync_wide(df)
-    metadata_by_sample = metadata or _metadata_from_path(source)
-    return CountsTable(
-        sample_id=counts.sample_id,
-        temperature_C=counts.temperature_C,
-        n_total=counts.n_total,
-        n_frozen=counts.n_frozen,
-        time_s=counts.time_s,
-        cycle=counts.cycle,
-        observation_id=counts.observation_id,
-        metadata=metadata_by_sample,
-    )
+    count_tables = parse_sync_wide(df, metadata=metadata_source)
+    return _apply_count_cycle_policy(count_tables, cycle_policy=cycle_policy, cycle=cycle)
 
 
 def map_count_columns(df: pd.DataFrame, columns: CountColumnMap) -> pd.DataFrame:
@@ -208,11 +219,146 @@ def map_count_columns(df: pd.DataFrame, columns: CountColumnMap) -> pd.DataFrame
     return mapped.loc[:, [column for column in _ordered_count_columns() if column in mapped]]
 
 
-def metadata_frame(
-    metadata_by_sample_id: dict[str, SampleMetadata],
-) -> pd.DataFrame:
+def _count_tables_from_long_dataframe(
+    df: pd.DataFrame,
+    metadata: Any,
+) -> list[CountsTable]:
+    tables: list[CountsTable] = []
+    groups = [
+        (str(sample_id), sample_df)
+        for sample_id, sample_df in df.groupby("sample_id", sort=False)
+    ]
+    metadata_by_sample = _metadata_mapping_for_sample_ids(
+        metadata,
+        [sample_id for sample_id, _ in groups],
+    )
+    for sample_key, sample_df in groups:
+        tables.append(
+            CountsTable.from_dataframe(
+                sample_df.reset_index(drop=True),
+                metadata=_metadata_for_sample_id(metadata_by_sample, sample_key),
+                processing_metadata=processing_metadata_for(
+                    "read_counts_input",
+                    parameters={"format": "long"},
+                    source_sample_ids=(sample_key,),
+                    source_cycles=_cycle_keys(_with_cycle_key(sample_df)),
+                ),
+            )
+        )
+    return tables
+
+
+def _apply_count_cycle_policy(
+    tables: list[CountsTable],
+    *,
+    cycle_policy: CountCyclePolicy,
+    cycle: Any | None,
+) -> CountsTable | list[CountsTable] | dict[str, CountsTable | list[CountsTable]]:
+    if cycle_policy not in ("single", "pooled", "preserve"):
+        raise ValueError("cycle_policy must be 'single', 'pooled', or 'preserve'")
+    if cycle is not None and cycle_policy != "single":
+        raise ValueError("cycle can only be selected when cycle_policy='single'")
+    if cycle_policy == "pooled":
+        return _single_or_list(
+            [
+                _with_cycle_policy_processing(
+                    table,
+                    cycle_policy="pooled",
+                    source_cycles=_cycle_keys(_with_cycle_key(table.to_dataframe())),
+                )
+                for table in tables
+            ]
+        )
+    if cycle_policy == "single":
+        return _single_or_list(
+            [
+                _select_counts_cycle(table, cycle)
+                for table in tables
+            ]
+        )
+    return _preserve_count_cycles(tables)
+
+
+def _preserve_count_cycles(tables: list[CountsTable]) -> dict[str, CountsTable | list[CountsTable]]:
+    grouped: dict[str, list[CountsTable]] = {}
+    for table in tables:
+        keyed = _with_cycle_key(table.to_dataframe())
+        for cycle_key, cycle_df in _iter_cycle_dataframes(keyed):
+            grouped.setdefault(cycle_key, []).append(
+                CountsTable.from_dataframe(
+                    cycle_df.reset_index(drop=True),
+                    metadata=table.metadata,
+                    processing_metadata=processing_metadata_for(
+                        "read_counts",
+                        inputs=(table,),
+                        parameters={"cycle_policy": "preserve"},
+                        source_sample_ids=_sample_ids_from_dataframe(cycle_df),
+                        source_cycles=(cycle_key,),
+                    ),
+                )
+            )
+    return {cycle_key: _single_or_list(cycle_tables) for cycle_key, cycle_tables in grouped.items()}
+
+
+def _select_counts_cycle(table: CountsTable, cycle: Any | None) -> CountsTable:
+    keyed = _with_cycle_key(table.to_dataframe())
+    cycle_keys = _cycle_keys(keyed)
+    selected_cycle = _selected_cycle_key(cycle_keys, cycle)
+    selected_df = keyed[keyed["_ufolaf_cycle_key"] == selected_cycle].drop(
+        columns="_ufolaf_cycle_key"
+    )
+    return CountsTable.from_dataframe(
+        selected_df.reset_index(drop=True),
+        metadata=table.metadata,
+        processing_metadata=processing_metadata_for(
+            "read_counts",
+            inputs=(table,),
+            parameters={"cycle_policy": "single", "cycle": selected_cycle},
+            source_sample_ids=_sample_ids_from_dataframe(selected_df),
+            source_cycles=(selected_cycle,),
+        ),
+    )
+
+
+def _single_or_list(tables: list[CountsTable]) -> CountsTable | list[CountsTable]:
+    return tables[0] if len(tables) == 1 else tables
+
+
+def _with_cycle_policy_processing(
+    table: CountsTable,
+    *,
+    cycle_policy: CountCyclePolicy,
+    source_cycles: list[str],
+) -> CountsTable:
+    return CountsTable(
+        sample_id=table.sample_id,
+        temperature_C=table.temperature_C,
+        n_total=table.n_total,
+        n_frozen=table.n_frozen,
+        time_s=table.time_s,
+        cycle=table.cycle,
+        observation_id=table.observation_id,
+        metadata=table.metadata,
+        processing_metadata=processing_metadata_for(
+            "read_counts",
+            inputs=(table,),
+            parameters={"cycle_policy": cycle_policy},
+            source_sample_ids=_sample_ids_from_dataframe(table.to_dataframe()),
+            source_cycles=tuple(source_cycles),
+        ),
+    )
+
+
+def _sample_ids_from_dataframe(df: pd.DataFrame) -> tuple[str, ...]:
+    if "sample_id" not in df:
+        return ()
+    return tuple(str(value) for value in pd.Series(df["sample_id"]).dropna().unique())
+
+
+def metadata_frame(metadata_source: Any) -> pd.DataFrame:
     """Return sample metadata as a human-readable DataFrame."""
 
+    metadata_by_sample_id = _metadata_mapping_from_source(metadata_source)
     return pd.DataFrame(
         [
             {
@@ -230,6 +376,25 @@ def metadata_frame(
             for sample_id, metadata in metadata_by_sample_id.items()
         ]
     )
+
+
+def tables_to_dataframe(table_or_tables: Any) -> pd.DataFrame:
+    """Return a display DataFrame from one UFOLAF table or a list of tables."""
+
+    if isinstance(table_or_tables, dict):
+        frames = []
+        for group_id, value in table_or_tables.items():
+            frame = tables_to_dataframe(value)
+            if not frame.empty:
+                frame.insert(0, "group_id", group_id)
+            frames.append(frame)
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if isinstance(table_or_tables, (list, tuple)):
+        frames = [table.to_dataframe() for table in table_or_tables]
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not hasattr(table_or_tables, "to_dataframe"):
+        raise TypeError("Expected a UFOLAF table or a list of UFOLAF tables")
+    return table_or_tables.to_dataframe()
 
 
 def infer_dilution_groups(
@@ -258,8 +423,12 @@ def split_metadata_rows(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return data_rows.reset_index(drop=True), metadata_rows.reset_index(drop=True)
 
 
-def parse_sync_wide(df: pd.DataFrame) -> CountsTable:
-    """Convert an Icescopy wide temperature-sync table into a CountsTable."""
+def parse_sync_wide(
+    df: pd.DataFrame,
+    *,
+    metadata: Any = None,
+) -> list[CountsTable]:
+    """Convert an Icescopy wide temperature-sync table into one CountsTable per sample."""
 
     data_rows, _ = split_metadata_rows(df)
     time_s = _time_seconds(data_rows)
@@ -272,11 +441,19 @@ def parse_sync_wide(df: pd.DataFrame) -> CountsTable:
         kind = match.group("kind")
         sample_columns.setdefault(sample_key, {})[kind] = column
 
-    records: list[dict[str, Any]] = []
+    sample_ids = [
+        _sample_id_from_header(sample_key)
+        for sample_key, columns in sample_columns.items()
+        if "total" in columns and "frozen" in columns
+    ]
+    metadata_by_sample = _metadata_mapping_for_sample_ids(metadata, sample_ids)
+
+    tables: list[CountsTable] = []
     for sample_key, columns in sample_columns.items():
         if "total" not in columns or "frozen" not in columns:
             continue
         sample_id = _sample_id_from_header(sample_key)
+        records: list[dict[str, Any]] = []
         for row_index, row in data_rows.iterrows():
             total = _to_float_or_nan(row[columns["total"]])
             frozen = _to_float_or_nan(row[columns["frozen"]])
@@ -293,9 +470,20 @@ def parse_sync_wide(df: pd.DataFrame) -> CountsTable:
                     "observation_id": row.get("picture", row.get("image_name", row_index)),
                 }
             )
-    if not records:
+        if records:
+            tables.append(
+                CountsTable.from_dataframe(
+                    pd.DataFrame.from_records(records),
+                    metadata=_metadata_for_sample_id(metadata_by_sample, sample_id),
+                    processing_metadata=processing_metadata_for(
+                        "parse_sync_wide",
+                        source_sample_ids=(sample_id,),
+                    ),
+                )
+            )
+    if not tables:
         raise ValueError("No sample number total/frozen column pairs found")
-    return CountsTable.from_dataframe(pd.DataFrame.from_records(records))
+    return tables
 
 
 def _is_sample_metadata_row(body: str) -> bool:
@@ -322,11 +510,249 @@ def _time_seconds(df: pd.DataFrame) -> np.ndarray:
     return elapsed.fillna(np.nan).to_numpy(dtype=float)
 
 
+def _with_cycle_key(df: pd.DataFrame) -> pd.DataFrame:
+    keyed = df.copy()
+    if "cycle" not in keyed:
+        keyed["_ufolaf_cycle_key"] = "missing"
+        return keyed
+    keyed["_ufolaf_cycle_key"] = [
+        _normalize_cycle_key(value) for value in keyed["cycle"].to_numpy(dtype=object)
+    ]
+    return keyed
+
+
+def _normalize_cycle_key(value: Any) -> str:
+    if value is None:
+        return "missing"
+    try:
+        if pd.isna(value):
+            return "missing"
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        numeric_value = float(value)
+        if np.isfinite(numeric_value) and numeric_value.is_integer():
+            return str(int(numeric_value))
+        return str(numeric_value)
+
+    text = str(value).strip()
+    if not text:
+        return "missing"
+    try:
+        numeric_value = float(text)
+    except ValueError:
+        return text
+    if np.isfinite(numeric_value) and numeric_value.is_integer():
+        return str(int(numeric_value))
+    return str(numeric_value)
+
+
+def _cycle_keys(df: pd.DataFrame) -> list[str]:
+    return [str(value) for value in pd.unique(df["_ufolaf_cycle_key"])]
+
+
+def _selected_cycle_key(cycle_keys: list[str], cycle: Any | None) -> str:
+    if not cycle_keys:
+        raise ValueError("No cycles found")
+    if cycle is None:
+        if len(cycle_keys) == 1:
+            return cycle_keys[0]
+        available = ", ".join(cycle_keys)
+        raise ValueError(
+            "Multiple cycles found. Pass cycle=..., use cycle_policy='pooled', "
+            f"or use cycle_policy='preserve'. Available cycles: {available}"
+        )
+    selected = _normalize_cycle_key(cycle)
+    if selected not in cycle_keys:
+        available = ", ".join(cycle_keys)
+        raise ValueError(f"Requested cycle {selected!r} not found. Available cycles: {available}")
+    return selected
+
+
+def _iter_cycle_dataframes(df: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
+    frames: list[tuple[str, pd.DataFrame]] = []
+    for cycle_key, cycle_df in df.groupby("_ufolaf_cycle_key", sort=False):
+        frames.append((str(cycle_key), cycle_df.drop(columns="_ufolaf_cycle_key").copy()))
+    return frames
+
+
 def _metadata_from_path(source: str | Path | pd.DataFrame) -> dict[str, SampleMetadata]:
     if isinstance(source, pd.DataFrame):
         return {}
     _, metadata = read_metadata(source)
     return metadata
+
+
+def _metadata_for_sample_id(metadata: Any, sample_id: str) -> SampleMetadata:
+    if isinstance(metadata, SampleMetadata):
+        return _metadata_with_sample_id(metadata, sample_id)
+    if isinstance(metadata, dict):
+        value = metadata.get(sample_id)
+        if isinstance(value, SampleMetadata):
+            return _metadata_with_sample_id(value, sample_id)
+    return SampleMetadata(sample_id=sample_id)
+
+
+def _metadata_mapping_for_sample_ids(
+    metadata_source: Any,
+    sample_ids: list[str],
+) -> dict[str, SampleMetadata]:
+    metadata_by_sample = _metadata_mapping_from_source(metadata_source, sample_ids=sample_ids)
+    return {
+        sample_id: _metadata_for_sample_id(metadata_by_sample, sample_id)
+        for sample_id in sample_ids
+    }
+
+
+def _metadata_mapping_from_source(
+    source: Any,
+    *,
+    sample_ids: list[str] | None = None,
+) -> dict[str, SampleMetadata]:
+    if source is None:
+        return {}
+    if isinstance(source, pd.DataFrame):
+        return _metadata_mapping_from_dataframe(source, sample_ids=sample_ids)
+    if isinstance(source, dict):
+        if not source:
+            return {}
+        if all(isinstance(value, SampleMetadata) for value in source.values()):
+            return {
+                str(sample_id): _metadata_with_sample_id(metadata, str(sample_id))
+                for sample_id, metadata in source.items()
+            }
+        if _looks_like_metadata_record(source):
+            return _metadata_mapping_from_record(source, sample_ids=sample_ids)
+        metadata_by_sample_id: dict[str, SampleMetadata] = {}
+        for key, value in source.items():
+            sample_id = str(key)
+            if isinstance(value, SampleMetadata):
+                metadata_by_sample_id[sample_id] = _metadata_with_sample_id(value, sample_id)
+            elif isinstance(value, dict):
+                metadata_by_sample_id[sample_id] = _sample_metadata_from_mapping(
+                    value,
+                    sample_id,
+                )
+            else:
+                metadata_by_sample_id.update(_metadata_mapping_from_source(value))
+        return metadata_by_sample_id
+    if isinstance(source, SampleMetadata):
+        if source.sample_id:
+            return {source.sample_id: source}
+        if sample_ids is not None:
+            return {sample_id: replace(source, sample_id=sample_id) for sample_id in sample_ids}
+        return {}
+    if isinstance(source, (list, tuple)):
+        metadata_by_sample_id: dict[str, SampleMetadata] = {}
+        for table in source:
+            metadata_by_sample_id.update(
+                _metadata_mapping_from_source(getattr(table, "metadata", None))
+            )
+        return metadata_by_sample_id
+    metadata = getattr(source, "metadata", None)
+    if metadata is not None:
+        return _metadata_mapping_from_source(metadata)
+    return {}
+
+
+def _metadata_mapping_from_dataframe(
+    df: pd.DataFrame,
+    *,
+    sample_ids: list[str] | None,
+) -> dict[str, SampleMetadata]:
+    if "sample_id" not in df:
+        if sample_ids is not None and len(sample_ids) == 1:
+            df = df.copy()
+            df["sample_id"] = sample_ids[0]
+        else:
+            raise ValueError("Metadata DataFrame must include a sample_id column")
+
+    metadata_by_sample_id: dict[str, SampleMetadata] = {}
+    for _, row in df.iterrows():
+        row_dict = row.to_dict()
+        sample_id = _metadata_text(row_dict.get("sample_id"))
+        if not sample_id:
+            raise ValueError("Metadata DataFrame contains an empty sample_id")
+        if sample_id in metadata_by_sample_id:
+            raise ValueError(f"Duplicate metadata row for sample_id {sample_id!r}")
+        metadata_by_sample_id[sample_id] = _sample_metadata_from_mapping(row_dict, sample_id)
+    return metadata_by_sample_id
+
+
+def _metadata_mapping_from_record(
+    values: dict[Any, Any],
+    *,
+    sample_ids: list[str] | None,
+) -> dict[str, SampleMetadata]:
+    if sample_ids is None:
+        sample_id = _metadata_text(values.get("sample_id"))
+        return {sample_id: _sample_metadata_from_mapping(values, sample_id)} if sample_id else {}
+    return {
+        sample_id: _sample_metadata_from_mapping(values, sample_id)
+        for sample_id in sample_ids
+    }
+
+
+def _looks_like_metadata_record(values: dict[Any, Any]) -> bool:
+    return any(str(key) in SAMPLE_METADATA_FIELDS for key in values)
+
+
+def _sample_metadata_from_mapping(values: dict[Any, Any], sample_id: str) -> SampleMetadata:
+    raw_sample_metadata = {
+        str(key): _metadata_text(value)
+        for key, value in values.items()
+        if key not in ("raw_preamble", "raw_sample_metadata")
+    }
+    if isinstance(values.get("raw_sample_metadata"), dict):
+        raw_sample_metadata.update(
+            {
+                str(key): _metadata_text(value)
+                for key, value in values["raw_sample_metadata"].items()
+            }
+        )
+    raw_preamble = (
+        {str(key): _metadata_text(value) for key, value in values["raw_preamble"].items()}
+        if isinstance(values.get("raw_preamble"), dict)
+        else {}
+    )
+
+    kwargs: dict[str, Any] = {
+        str(key): value
+        for key, value in values.items()
+        if str(key) in SAMPLE_METADATA_FIELDS
+        and str(key) not in ("sample_id", "raw_preamble", "raw_sample_metadata")
+        and not _is_missing_metadata_value(value)
+    }
+    kwargs["sample_id"] = sample_id
+    kwargs["raw_preamble"] = raw_preamble
+    kwargs["raw_sample_metadata"] = raw_sample_metadata
+    return SampleMetadata(**kwargs)
+
+
+def _metadata_with_sample_id(metadata: SampleMetadata, sample_id: str) -> SampleMetadata:
+    if metadata.sample_id == sample_id:
+        return metadata
+    if not metadata.sample_id:
+        return replace(metadata, sample_id=sample_id)
+    return metadata
+
+
+def _metadata_text(value: Any) -> str:
+    return "" if _is_missing_metadata_value(value) else str(value)
+
+
+def _is_missing_metadata_value(value: Any) -> bool:
+    if value is None:
+        return True
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(missing, (bool, np.bool_)):
+        return bool(missing)
+    return False
 
 
 def _count_column_names() -> set[str]:
@@ -354,7 +780,9 @@ def _resolve_counts_format(df: pd.DataFrame, format: CountInputFormat) -> Litera
         _require_wide_count_columns(df)
         return "wide"
     if normalized != "auto":
-        raise ValueError("format must be one of auto, long, canonical, icescopy, icescopy_wide, wide")
+        raise ValueError(
+            "format must be one of auto, long, canonical, icescopy, icescopy_wide, wide"
+        )
     if _has_long_count_columns(df):
         return "long"
     if _has_wide_count_columns(df):
@@ -420,17 +848,18 @@ def parse_olaf_frozen_at_temp(
     df: pd.DataFrame,
     *,
     n_total_by_sample: dict[str, float],
-) -> TemperatureFrozenFractionTable:
-    """Convert an OLAF frozen_at_temp table into a TemperatureFrozenFractionTable."""
+) -> list[TemperatureFrozenFractionTable]:
+    """Convert an OLAF frozen_at_temp table into one table per sample column."""
 
     if "degC" not in df:
         raise ValueError("OLAF frozen_at_temp data must include a 'degC' column")
-    records: list[dict[str, Any]] = []
+    tables: list[TemperatureFrozenFractionTable] = []
     for column in df.columns:
         if column == "degC":
             continue
         if column not in n_total_by_sample:
             raise KeyError(f"Missing n_total for sample column {column!r}")
+        records: list[dict[str, Any]] = []
         for _, row in df.iterrows():
             frozen = _to_float_or_nan(row[column])
             if not np.isfinite(frozen):
@@ -443,13 +872,22 @@ def parse_olaf_frozen_at_temp(
                     "n_frozen": frozen,
                 }
             )
-    result = pd.DataFrame.from_records(records)
-    return TemperatureFrozenFractionTable(
-        sample_id=result["sample_id"].to_numpy(dtype=object),
-        temperature_C=result["temperature_C"].to_numpy(dtype=float),
-        n_total=result["n_total"].to_numpy(dtype=float),
-        n_frozen=result["n_frozen"].to_numpy(dtype=float),
-    )
+        if records:
+            result = pd.DataFrame.from_records(records)
+            tables.append(
+                TemperatureFrozenFractionTable(
+                    sample_id=result["sample_id"].to_numpy(dtype=object),
+                    temperature_C=result["temperature_C"].to_numpy(dtype=float),
+                    n_total=result["n_total"].to_numpy(dtype=float),
+                    n_frozen=result["n_frozen"].to_numpy(dtype=float),
+                    processing_metadata=processing_metadata_for(
+                        "parse_olaf_frozen_at_temp",
+                        parameters={"n_total": float(n_total_by_sample[column])},
+                        source_sample_ids=(column,),
+                    ),
+                )
+            )
+    return tables
 
 
 read_commented_preamble = read_preamble

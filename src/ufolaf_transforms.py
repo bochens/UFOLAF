@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-from dataclasses import replace
 from typing import Any, Literal
 
 import numpy as np
@@ -10,12 +9,12 @@ import pandas as pd
 from ufolaf_math import (
     PROFILE_LIKELIHOOD_DROP_95,
     binomial_poisson_mle_with_profile_errors,
-    bin_temperature,
     cumulative_inp_per_ml_with_errors_from_counts,
     differential_inp_per_ml_per_c_from_counts,
     normalize_inp_air,
     normalize_inp_soil,
-    temperature_bin_edges,
+    temperature_threshold_edges,
+    temperature_thresholds,
     water_blank_corrected_counts,
 )
 from ufolaf_models import (
@@ -24,28 +23,175 @@ from ufolaf_models import (
     DifferentialNucleusSpectrumTable,
     MetadataLike,
     NormalizedInpSpectrumTable,
+    ProcessingMetadata,
     SampleMetadata,
     SpectrumBasis,
     TemperatureDependentTable,
     TemperatureFrozenFractionTable,
+    processing_metadata_for,
 )
 
 
-CyclePolicy = Literal["single", "pooled", "preserve"]
 TemperatureReductionMethod = Literal["max", "latest"]
 OLAF_AGRESTI_COULL_UNCERTAIN_VALUES = 2
+TableSequence = list[Any] | tuple[Any, ...]
+TableMapping = dict[str, Any]
+
+
+def _is_table_sequence(value: Any) -> bool:
+    return isinstance(value, (list, tuple))
+
+
+def _is_table_mapping(value: Any) -> bool:
+    return isinstance(value, dict)
+
+
+def _require_table_sequence(
+    tables: TableSequence,
+    allowed_types: tuple[type[Any], ...],
+    name: str,
+    *,
+    allow_empty: bool = True,
+) -> None:
+    if not allow_empty and len(tables) == 0:
+        raise ValueError(f"{name} cannot be empty")
+    for index, table in enumerate(tables):
+        if not isinstance(table, allowed_types):
+            allowed = ", ".join(table_type.__name__ for table_type in allowed_types)
+            raise TypeError(f"{name}[{index}] must be {allowed}")
+
+
+def _map_table_shape(value: Any, mapper: Any) -> Any:
+    if _is_table_mapping(value):
+        return {key: _map_table_shape(nested, mapper) for key, nested in value.items()}
+    if _is_table_sequence(value):
+        return [_map_table_shape(nested, mapper) for nested in value]
+    return mapper(value)
+
+
+def _map_merge_shape(value: Any, merger: Any) -> Any:
+    if _is_table_mapping(value):
+        return {key: _map_merge_shape(nested, merger) for key, nested in value.items()}
+    return merger(value)
+
+
+def _table_sample_ids_from_dataframe(df: pd.DataFrame) -> tuple[str, ...]:
+    if "sample_id" not in df:
+        return ()
+    return tuple(str(value) for value in pd.Series(df["sample_id"]).dropna().unique())
+
+
+def _source_cycles_from_tables(tables: TableSequence) -> tuple[str, ...]:
+    cycles: list[str] = []
+    for table in tables:
+        processing = getattr(table, "processing_metadata", None)
+        generated_by = getattr(processing, "generated_by", None)
+        cycles.extend(getattr(generated_by, "source_cycles", ()) or ())
+    return tuple(cycles)
+
+
+def _plain_processing_value(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return [_plain_processing_value(item) for item in value.tolist()]
+    if isinstance(value, (list, tuple)):
+        return [_plain_processing_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _plain_processing_value(item) for key, item in value.items()}
+    return value
+
+
+def _fraction_frozen_parameters(
+    step_C: float,
+    method: TemperatureReductionMethod,
+    temperature_tolerance_C: float,
+) -> dict[str, Any]:
+    return {
+        "step_C": step_C,
+        "method": method,
+        "temperature_tolerance_C": temperature_tolerance_C,
+    }
+
+
+def _metadata_dilutions(metadata_by_sample_id: dict[str, SampleMetadata]) -> tuple[Any, ...]:
+    return tuple(
+        metadata_by_sample_id[sample_id].dilution
+        for sample_id in metadata_by_sample_id
+    )
+
+
+def _merged_fraction_input_for_stitch_or_mle(
+    tables: TableSequence,
+) -> TemperatureFrozenFractionTable:
+    _require_table_sequence(
+        tables,
+        (TemperatureFrozenFractionTable,),
+        "table",
+        allow_empty=False,
+    )
+    frames = [
+        table.to_dataframe()
+        for table in tables
+        if isinstance(table, TemperatureFrozenFractionTable)
+    ]
+    combined = pd.concat(frames, ignore_index=True)
+    return TemperatureFrozenFractionTable.from_dataframe(
+        combined,
+        metadata=_merge_table_metadata(tables),
+        processing_metadata=processing_metadata_for(
+            "merge_fraction_inputs",
+            inputs=tuple(tables),
+            source_sample_ids=_table_sample_ids_from_dataframe(combined),
+        ),
+    )
+
+
+def _merge_table_metadata(tables: TableSequence) -> dict[str, SampleMetadata] | None:
+    metadata_by_sample_id: dict[str, SampleMetadata] = {}
+    for table in tables:
+        metadata = table.metadata
+        if isinstance(metadata, dict):
+            metadata_by_sample_id.update(copy.deepcopy(metadata))
+            continue
+        if isinstance(metadata, SampleMetadata):
+            sample_ids = pd.Series(table.sample_id).astype(str).unique()
+            if metadata.sample_id:
+                metadata_by_sample_id[metadata.sample_id] = copy.deepcopy(metadata)
+            elif len(sample_ids) == 1:
+                metadata_by_sample_id[str(sample_ids[0])] = copy.deepcopy(metadata)
+            else:
+                raise KeyError("SampleMetadata.sample_id is required for multi-sample tables")
+    return metadata_by_sample_id or None
 
 
 def apply_water_blank_correction(
-    table: CountsTable | TemperatureFrozenFractionTable,
+    table: CountsTable | TemperatureFrozenFractionTable | TableSequence | TableMapping,
     water_blank_frozen: Any,
-) -> CountsTable | TemperatureFrozenFractionTable:
+) -> CountsTable | TemperatureFrozenFractionTable | list[Any] | dict[str, Any]:
     """Return a new count table after same-run water/DI blank correction.
 
     The water blank frozen count is subtracted from both n_frozen and n_total.
     The physical interpretation is that wells freezing in the water/DI blank are
     treated as unavailable sample wells at that temperature.
     """
+
+    if _is_table_mapping(table):
+        return {
+            key: apply_water_blank_correction(
+                nested,
+                water_blank_frozen[key]
+                if isinstance(water_blank_frozen, dict)
+                else water_blank_frozen,
+            )
+            for key, nested in table.items()
+        }
+    if _is_table_sequence(table):
+        _require_table_sequence(table, (CountsTable, TemperatureFrozenFractionTable), "table")
+        return [
+            apply_water_blank_correction(single_table, water_blank_frozen)
+            for single_table in table
+        ]
 
     corrected_frozen, corrected_total = water_blank_corrected_counts(
         table.n_frozen,
@@ -62,6 +208,12 @@ def apply_water_blank_correction(
             cycle=table.cycle,
             observation_id=table.observation_id,
             metadata=table.metadata,
+            processing_metadata=processing_metadata_for(
+                "apply_water_blank_correction",
+                inputs=(table,),
+                parameters={"water_blank_frozen": _plain_processing_value(water_blank_frozen)},
+                source_sample_ids=tuple(pd.Series(table.sample_id).astype(str).unique()),
+            ),
         )
     if isinstance(table, TemperatureFrozenFractionTable):
         return TemperatureFrozenFractionTable(
@@ -75,68 +227,138 @@ def apply_water_blank_correction(
             n_frozen=corrected_frozen,
             obs_count=table.obs_count,
             metadata=table.metadata,
+            processing_metadata=processing_metadata_for(
+                "apply_water_blank_correction",
+                inputs=(table,),
+                parameters={"water_blank_frozen": _plain_processing_value(water_blank_frozen)},
+                source_sample_ids=tuple(pd.Series(table.sample_id).astype(str).unique()),
+            ),
         )
     raise TypeError("table must be a CountsTable or TemperatureFrozenFractionTable")
 
 
 def counts_to_temperature_frozen_fraction(
-    counts: CountsTable,
+    counts: CountsTable | TableSequence | TableMapping,
     *,
     step_C: float = 0.5,
     method: TemperatureReductionMethod = "max",
-    cycle_policy: CyclePolicy = "single",
-    cycle: Any | None = None,
-) -> TemperatureFrozenFractionTable | list[TemperatureFrozenFractionTable]:
-    """Reduce raw count observations to temperature-binned frozen-fraction table(s).
+    temperature_tolerance_C: float = 0.05,
+    **unexpected_kwargs: Any,
+) -> TemperatureFrozenFractionTable | list[Any] | dict[str, Any]:
+    """Reduce raw count observations to threshold-evaluated frozen-fraction table(s).
 
-    ``method="max"`` selects by corrected frozen fraction within each bin, then
-    carries forward the best fraction across colder bins while preserving paired
-    n_total/n_frozen counts. ``method="latest"`` keeps the latest paired count
-    row within each bin and does not force monotonicity.
-    ``cycle_policy="single"`` returns one table and requires one cycle unless a
-    specific ``cycle=...`` is selected. ``cycle_policy="pooled"`` reduces each
-    cycle first, then sums n_frozen/n_total across cycles.
-    ``cycle_policy="preserve"`` returns one normal-schema table per cycle.
+    Output rows are labeled by cold temperature thresholds, not centered bins. A
+    row labeled ``-7.5`` means the cumulative state when cooling has reached
+    ``-7.5 C``, with ``temperature_tolerance_C`` slack for probe jitter.
+    ``method="max"`` uses the highest frozen fraction observed up to each
+    threshold while preserving paired n_total/n_frozen counts.
+    ``method="latest"`` uses the first observed row after crossing the threshold
+    and does not force monotonicity.
+    Cycle selection is handled by ``read_counts``. If a table was read with
+    ``cycle_policy="pooled"``, this function reduces each cycle first, then sums
+    n_frozen/n_total across cycles on the temperature-threshold grid. Dict and
+    list inputs keep their input shape.
     """
 
+    if unexpected_kwargs:
+        names = ", ".join(sorted(unexpected_kwargs))
+        raise TypeError(
+            f"Unexpected keyword argument(s): {names}. Pass cycle_policy to read_counts."
+        )
+
+    return _map_table_shape(
+        counts,
+        lambda single_counts: _counts_to_temperature_frozen_fraction_one(
+            single_counts,
+            step_C=step_C,
+            method=method,
+            temperature_tolerance_C=temperature_tolerance_C,
+        ),
+    )
+
+
+def _counts_to_temperature_frozen_fraction_one(
+    counts: CountsTable,
+    *,
+    step_C: float,
+    method: TemperatureReductionMethod,
+    temperature_tolerance_C: float,
+) -> TemperatureFrozenFractionTable:
+    if not isinstance(counts, CountsTable):
+        raise TypeError("counts must be a CountsTable")
     if method not in ("max", "latest"):
         raise ValueError("method must be 'max' or 'latest'")
-    if cycle_policy not in ("single", "pooled", "preserve"):
-        raise ValueError("cycle_policy must be 'single', 'pooled', or 'preserve'")
-    if cycle is not None and cycle_policy != "single":
-        raise ValueError("cycle can only be selected when cycle_policy='single'")
+    if temperature_tolerance_C < 0:
+        raise ValueError("temperature_tolerance_C cannot be negative")
 
+    reduction_label = f"cold_threshold_{method}_tol_{temperature_tolerance_C:g}C"
     df = counts.to_dataframe()
     if df.empty:
         empty_table = _empty_temperature_frozen_fraction(
             step_C=step_C,
-            temperature_bin_method=method,
+            temperature_bin_method=reduction_label,
             metadata=counts.metadata,
+            processing_metadata=processing_metadata_for(
+                "fraction_frozen",
+                inputs=(counts,),
+                parameters=_fraction_frozen_parameters(
+                    step_C,
+                    method,
+                    temperature_tolerance_C,
+                ),
+                source_sample_ids=tuple(pd.Series(counts.sample_id).astype(str).unique()),
+            ),
         )
-        return [empty_table] if cycle_policy == "preserve" else empty_table
+        return empty_table
 
     df = _valid_counts_dataframe(df)
     if df.empty:
         empty_table = _empty_temperature_frozen_fraction(
             step_C=step_C,
-            temperature_bin_method=method,
+            temperature_bin_method=reduction_label,
             metadata=counts.metadata,
+            processing_metadata=processing_metadata_for(
+                "fraction_frozen",
+                inputs=(counts,),
+                parameters=_fraction_frozen_parameters(
+                    step_C,
+                    method,
+                    temperature_tolerance_C,
+                ),
+                source_sample_ids=tuple(pd.Series(counts.sample_id).astype(str).unique()),
+            ),
         )
-        return [empty_table] if cycle_policy == "preserve" else empty_table
+        return empty_table
 
     df = _with_cycle_key(df)
     cycle_keys = _cycle_keys(df)
-    if cycle_policy == "single":
-        selected_cycle = _selected_cycle_key(cycle_keys, cycle)
-        selected_df = df[df["_ufolaf_cycle_key"] == selected_cycle].drop(
-            columns="_ufolaf_cycle_key"
-        )
+    cycle_policy = _cycle_policy_from_counts(counts)
+    if cycle_policy != "pooled":
+        if len(cycle_keys) > 1:
+            available = ", ".join(cycle_keys)
+            raise ValueError(
+                "Multiple cycles found in one CountsTable. Use read_counts(..., "
+                f"cycle_policy='single' or 'preserve'). Available cycles: {available}"
+            )
+        selected_df = df.drop(columns="_ufolaf_cycle_key")
         return _counts_dataframe_to_temperature_frozen_fraction(
             selected_df,
             step_C=step_C,
             method=method,
-            temperature_bin_method=method,
+            temperature_tolerance_C=temperature_tolerance_C,
+            temperature_bin_method=reduction_label,
             metadata=counts.metadata,
+            processing_metadata=processing_metadata_for(
+                "fraction_frozen",
+                inputs=(counts,),
+                parameters=_fraction_frozen_parameters(
+                    step_C,
+                    method,
+                    temperature_tolerance_C,
+                ),
+                source_sample_ids=_table_sample_ids_from_dataframe(selected_df),
+                source_cycles=tuple(cycle_keys),
+            ),
         )
 
     cycle_tables = [
@@ -144,18 +366,29 @@ def counts_to_temperature_frozen_fraction(
             cycle_df,
             step_C=step_C,
             method=method,
-            temperature_bin_method=method,
+            temperature_tolerance_C=temperature_tolerance_C,
+            temperature_bin_method=reduction_label,
             metadata=counts.metadata,
+            processing_metadata=processing_metadata_for(
+                "fraction_frozen",
+                inputs=(counts,),
+                parameters=_fraction_frozen_parameters(
+                    step_C,
+                    method,
+                    temperature_tolerance_C,
+                ),
+                source_sample_ids=_table_sample_ids_from_dataframe(cycle_df),
+                source_cycles=(cycle_key,),
+            ),
         )
-        for _, cycle_df in _iter_cycle_dataframes(df)
+        for cycle_key, cycle_df in _iter_cycle_dataframes(df)
     ]
-    if cycle_policy == "preserve":
-        return cycle_tables
     return _pool_temperature_frozen_fraction_tables(
         cycle_tables,
         step_C=step_C,
-        temperature_bin_method=method,
+        temperature_bin_method=reduction_label,
         metadata=counts.metadata,
+        source_counts=counts,
     )
 
 
@@ -164,44 +397,43 @@ def _counts_dataframe_to_temperature_frozen_fraction(
     *,
     step_C: float,
     method: TemperatureReductionMethod,
+    temperature_tolerance_C: float,
     temperature_bin_method: str,
     metadata: MetadataLike,
+    processing_metadata: ProcessingMetadata,
 ) -> TemperatureFrozenFractionTable:
     if df.empty:
         return _empty_temperature_frozen_fraction(
             step_C=step_C,
             temperature_bin_method=temperature_bin_method,
             metadata=metadata,
+            processing_metadata=processing_metadata,
         )
-    df["temperature_C"] = bin_temperature(df["temperature_C"].to_numpy(copy=True), step_C)
-    sort_columns = ["sample_id", "temperature_C"]
-    ascending = [True, False]
-    if "time_s" in df:
-        sort_columns.append("time_s")
-        ascending.append(True)
-    df = df.sort_values(sort_columns, ascending=ascending, kind="mergesort")
-    grouped = df.groupby(["sample_id", "temperature_C"], sort=False)
-    if method == "max":
-        df["_ufolaf_fraction_frozen"] = df["n_frozen"] / df["n_total"]
-        reduced = df.loc[grouped["_ufolaf_fraction_frozen"].idxmax()].copy()
-        reduced = reduced.set_index(["sample_id", "temperature_C"])
-        reduced = reduced[["n_total", "n_frozen"]]
-        reduced["obs_count"] = grouped.size()
-    else:
-        reduced = grouped.tail(1).set_index(["sample_id", "temperature_C"])
-        reduced = reduced[["n_total", "n_frozen"]]
-        reduced["obs_count"] = grouped.size()
-    reduced = reduced.reset_index()
 
-    fixed_frames: list[pd.DataFrame] = []
-    for _, sample_df in reduced.groupby("sample_id", sort=False):
-        sample_df = sample_df.sort_values("temperature_C", ascending=False).copy()
-        if method == "max":
-            sample_df = _enforce_cumulative_fraction_pairs(sample_df)
-        fixed_frames.append(sample_df)
-
-    result = pd.concat(fixed_frames, ignore_index=True) if fixed_frames else reduced
-    bin_left, bin_right = temperature_bin_edges(
+    reduced_frames = [
+        _sample_counts_to_temperature_thresholds(
+            sample_id,
+            sample_df,
+            step_C=step_C,
+            method=method,
+            temperature_tolerance_C=temperature_tolerance_C,
+        )
+        for sample_id, sample_df in df.groupby("sample_id", sort=False)
+    ]
+    result = (
+        pd.concat([frame for frame in reduced_frames if not frame.empty], ignore_index=True)
+        if reduced_frames
+        else pd.DataFrame()
+    )
+    if result.empty:
+        return _empty_temperature_frozen_fraction(
+            step_C=step_C,
+            temperature_bin_method=temperature_bin_method,
+            metadata=metadata,
+            processing_metadata=processing_metadata,
+        )
+    result = result.sort_values(["sample_id", "temperature_C"], ascending=[True, False])
+    bin_left, bin_right = temperature_threshold_edges(
         result["temperature_C"].to_numpy(dtype=float, copy=True),
         step_C,
     )
@@ -216,28 +448,69 @@ def _counts_dataframe_to_temperature_frozen_fraction(
         n_frozen=result["n_frozen"].to_numpy(dtype=float, copy=True),
         obs_count=result["obs_count"].to_numpy(dtype=int, copy=True),
         metadata=metadata,
+        processing_metadata=processing_metadata,
     )
 
 
-def _enforce_cumulative_fraction_pairs(sample_df: pd.DataFrame) -> pd.DataFrame:
-    """Carry forward the highest corrected fraction while preserving count pairs."""
+def _sample_counts_to_temperature_thresholds(
+    sample_id: Any,
+    sample_df: pd.DataFrame,
+    *,
+    step_C: float,
+    method: TemperatureReductionMethod,
+    temperature_tolerance_C: float,
+) -> pd.DataFrame:
+    if sample_df.empty:
+        return pd.DataFrame()
 
-    result = sample_df.copy()
-    fraction = result["n_frozen"].to_numpy(dtype=float) / result["n_total"].to_numpy(dtype=float)
-    best_positions: list[int] = []
-    best_position = 0
-    best_fraction = -np.inf
-    for position, value in enumerate(fraction):
-        if np.isfinite(value) and value >= best_fraction:
-            best_fraction = value
-            best_position = position
-        best_positions.append(best_position)
+    if "time_s" in sample_df:
+        sample_df = sample_df.sort_values(["time_s", "temperature_C"], ascending=[True, False])
+    else:
+        sample_df = sample_df.sort_values("temperature_C", ascending=False)
+    sample_df = sample_df.reset_index(drop=True)
 
-    source_total = result["n_total"].to_numpy(dtype=float, copy=True)
-    source_frozen = result["n_frozen"].to_numpy(dtype=float, copy=True)
-    result["n_total"] = source_total[best_positions]
-    result["n_frozen"] = source_frozen[best_positions]
-    return result
+    thresholds = temperature_thresholds(sample_df["temperature_C"].to_numpy(dtype=float), step_C)
+    if thresholds.size == 0:
+        return pd.DataFrame()
+
+    temperatures = sample_df["temperature_C"].to_numpy(dtype=float, copy=True)
+    n_total = sample_df["n_total"].to_numpy(dtype=float, copy=True)
+    n_frozen = sample_df["n_frozen"].to_numpy(dtype=float, copy=True)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fraction = n_frozen / n_total
+
+    rows: list[dict[str, Any]] = []
+    previous_observation_count = 0
+    for threshold in thresholds:
+        observed_positions = np.flatnonzero(temperatures >= threshold - temperature_tolerance_C)
+        if observed_positions.size == 0:
+            continue
+        selected_position = (
+            _latest_fraction_max_position(fraction, observed_positions)
+            if method == "max"
+            else int(observed_positions[-1])
+        )
+        obs_count = max(1, int(observed_positions.size) - previous_observation_count)
+        rows.append(
+            {
+                "sample_id": sample_id,
+                "temperature_C": float(threshold),
+                "n_total": n_total[selected_position],
+                "n_frozen": n_frozen[selected_position],
+                "obs_count": obs_count,
+            }
+        )
+        previous_observation_count = int(observed_positions.size)
+    return pd.DataFrame.from_records(rows)
+
+
+def _latest_fraction_max_position(fraction: np.ndarray, positions: np.ndarray) -> int:
+    window = fraction[positions]
+    finite = np.isfinite(window)
+    if not finite.any():
+        return int(positions[-1])
+    max_fraction = np.max(window[finite])
+    return int(positions[np.flatnonzero(finite & (window == max_fraction))[-1]])
 
 
 def _valid_counts_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -294,30 +567,20 @@ def _cycle_keys(df: pd.DataFrame) -> list[str]:
     return [str(value) for value in pd.unique(df["_ufolaf_cycle_key"])]
 
 
-def _selected_cycle_key(cycle_keys: list[str], cycle: Any | None) -> str:
-    if not cycle_keys:
-        raise ValueError("No cycles found")
-    if cycle is None:
-        if len(cycle_keys) == 1:
-            return cycle_keys[0]
-        available = ", ".join(cycle_keys)
-        raise ValueError(
-            "Multiple cycles found. Pass cycle=... for cycle_policy='single', "
-            "or use cycle_policy='pooled' or cycle_policy='preserve'. "
-            f"Available cycles: {available}"
-        )
-    selected = _normalize_cycle_key(cycle)
-    if selected not in cycle_keys:
-        available = ", ".join(cycle_keys)
-        raise ValueError(f"Requested cycle {selected!r} not found. Available cycles: {available}")
-    return selected
-
-
 def _iter_cycle_dataframes(df: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
     frames: list[tuple[str, pd.DataFrame]] = []
     for cycle_key, cycle_df in df.groupby("_ufolaf_cycle_key", sort=False):
         frames.append((str(cycle_key), cycle_df.drop(columns="_ufolaf_cycle_key").copy()))
     return frames
+
+
+def _cycle_policy_from_counts(counts: CountsTable) -> str:
+    generated_by = counts.processing_metadata.generated_by
+    if generated_by is not None and generated_by.operation == "read_counts":
+        cycle_policy = generated_by.parameters.get("cycle_policy")
+        if cycle_policy:
+            return str(cycle_policy)
+    return "single"
 
 
 def _pool_temperature_frozen_fraction_tables(
@@ -326,12 +589,18 @@ def _pool_temperature_frozen_fraction_tables(
     step_C: float,
     temperature_bin_method: str,
     metadata: MetadataLike,
+    source_counts: CountsTable | None = None,
 ) -> TemperatureFrozenFractionTable:
     if not tables:
         return _empty_temperature_frozen_fraction(
             step_C=step_C,
             temperature_bin_method=temperature_bin_method,
             metadata=metadata,
+            processing_metadata=processing_metadata_for(
+                "pool_cycles",
+                inputs=(source_counts,) if source_counts is not None else (),
+                parameters={"step_C": step_C},
+            ),
         )
 
     combined = pd.concat([table.to_dataframe() for table in tables], ignore_index=True)
@@ -364,6 +633,13 @@ def _pool_temperature_frozen_fraction_tables(
         if "obs_count" in pooled
         else None,
         metadata=metadata,
+        processing_metadata=processing_metadata_for(
+            "pool_cycles",
+            inputs=tuple(tables),
+            parameters={"step_C": step_C, "temperature_bin_method": temperature_bin_method},
+            source_sample_ids=_table_sample_ids_from_dataframe(combined),
+            source_cycles=_source_cycles_from_tables(tables),
+        ),
     )
 
 
@@ -372,6 +648,7 @@ def _empty_temperature_frozen_fraction(
     step_C: float,
     temperature_bin_method: str,
     metadata: MetadataLike,
+    processing_metadata: ProcessingMetadata,
 ) -> TemperatureFrozenFractionTable:
     return TemperatureFrozenFractionTable(
         sample_id=np.array([], dtype=object),
@@ -382,14 +659,31 @@ def _empty_temperature_frozen_fraction(
         n_frozen=np.array([], dtype=float),
         obs_count=np.array([], dtype=int),
         metadata=metadata,
+        processing_metadata=processing_metadata,
     )
 
 
 def temperature_frozen_fraction_to_differential_spectrum(
-    table: TemperatureFrozenFractionTable,
+    table: TemperatureFrozenFractionTable | TableSequence | TableMapping,
     metadata_by_sample_id: dict[str, SampleMetadata] | None = None,
-) -> DifferentialNucleusSpectrumTable:
-    """Convert a temperature frozen-fraction table to differential k(T)."""
+) -> DifferentialNucleusSpectrumTable | list[Any] | dict[str, Any]:
+    """Convert a threshold frozen-fraction table to Vali differential k(T).
+
+    Input rows are interpreted as cold threshold states. Each value is calculated
+    from the newly frozen wells in that finite interval. Following Vali's
+    notation, output ``temperature_C`` is the warm side of the interval, while
+    ``temperature_bin_left_C`` and ``temperature_bin_right_C`` retain the cold
+    and warm interval limits.
+    """
+
+    if _is_table_mapping(table) or _is_table_sequence(table):
+        return _map_table_shape(
+            table,
+            lambda single_table: temperature_frozen_fraction_to_differential_spectrum(
+                single_table,
+                metadata_by_sample_id,
+            ),
+        )
 
     metadata_by_sample_id = resolve_metadata_by_sample_id(table, metadata_by_sample_id)
     if table.temperature_bin_width_C is None:
@@ -413,7 +707,7 @@ def temperature_frozen_fraction_to_differential_spectrum(
         out = pd.DataFrame(
             {
                 "sample_id": sample_df["sample_id"].to_numpy(dtype=object, copy=True),
-                "temperature_C": sample_df["temperature_C"].to_numpy(dtype=float, copy=True),
+                "temperature_C": _differential_temperature_label(sample_df),
                 "value": k_value,
                 "value_unit": "INP_per_mL_suspension_per_C",
                 "basis": "suspension",
@@ -434,6 +728,11 @@ def temperature_frozen_fraction_to_differential_spectrum(
             value_unit="INP_per_mL_suspension_per_C",
             basis="suspension",
             metadata=metadata_by_sample_id,
+            processing_metadata=processing_metadata_for(
+                "differential_spec",
+                inputs=(table,),
+                source_sample_ids=tuple(metadata_by_sample_id),
+            ),
         )
     return DifferentialNucleusSpectrumTable(
         sample_id=result["sample_id"].to_numpy(dtype=object, copy=True),
@@ -447,16 +746,39 @@ def temperature_frozen_fraction_to_differential_spectrum(
         basis="suspension",
         qc_flag=result["qc_flag"].to_numpy(dtype=int, copy=True),
         metadata=metadata_by_sample_id,
+        processing_metadata=processing_metadata_for(
+            "differential_spec",
+            inputs=(table,),
+            source_sample_ids=_table_sample_ids_from_dataframe(result),
+        ),
     )
 
 
+def _differential_temperature_label(sample_df: pd.DataFrame) -> np.ndarray:
+    """Return Vali-style warm-side temperature labels for finite intervals."""
+
+    if "temperature_bin_right_C" in sample_df:
+        return sample_df["temperature_bin_right_C"].to_numpy(dtype=float, copy=True)
+    return sample_df["temperature_C"].to_numpy(dtype=float, copy=True)
+
+
 def temperature_frozen_fraction_to_cumulative_spectrum(
-    table: TemperatureFrozenFractionTable,
+    table: TemperatureFrozenFractionTable | TableSequence | TableMapping,
     metadata_by_sample_id: dict[str, SampleMetadata] | None = None,
     *,
     z: float = 1.96,
-) -> CumulativeNucleusSpectrumTable:
+) -> CumulativeNucleusSpectrumTable | list[Any] | dict[str, Any]:
     """Convert each dilution independently to cumulative K(T)."""
+
+    if _is_table_mapping(table) or _is_table_sequence(table):
+        return _map_table_shape(
+            table,
+            lambda single_table: temperature_frozen_fraction_to_cumulative_spectrum(
+                single_table,
+                metadata_by_sample_id,
+                z=z,
+            ),
+        )
 
     metadata_by_sample_id = resolve_metadata_by_sample_id(table, metadata_by_sample_id)
     frames: list[pd.DataFrame] = []
@@ -503,32 +825,64 @@ def temperature_frozen_fraction_to_cumulative_spectrum(
             value_unit="INP_per_mL_suspension",
             basis="suspension",
             metadata=metadata_by_sample_id,
+            processing_metadata=processing_metadata_for(
+                "cumulative_spec",
+                inputs=(table,),
+                parameters={"z": z},
+                source_sample_ids=tuple(metadata_by_sample_id),
+                source_dilutions=_metadata_dilutions(metadata_by_sample_id),
+            ),
         )
     return CumulativeNucleusSpectrumTable.from_dataframe(
         result,
         value_unit="INP_per_mL_suspension",
         basis="suspension",
         metadata=metadata_by_sample_id,
+        processing_metadata=processing_metadata_for(
+            "cumulative_spec",
+            inputs=(table,),
+            parameters={"z": z},
+            source_sample_ids=_table_sample_ids_from_dataframe(result),
+            source_dilutions=_metadata_dilutions(metadata_by_sample_id),
+        ),
     )
 
 
 def temperature_frozen_fraction_to_stitched_cumulative_spectrum(
-    table: TemperatureFrozenFractionTable,
+    table: TemperatureFrozenFractionTable | TableSequence | TableMapping,
     metadata_by_sample_id: dict[str, SampleMetadata] | None = None,
     *,
     sample_group_by: Literal["sample_id", "sample_name", "sample_long_name"]
-    | dict[str, str] = "sample_long_name",
+    | dict[str, str]
+    | None = None,
     enforce_monotone: bool = False,
     z: float = 1.96,
-) -> CumulativeNucleusSpectrumTable:
+) -> CumulativeNucleusSpectrumTable | dict[str, Any]:
     """Stitch serial dilutions into one cumulative K(T) spectrum.
 
-    The default follows OLAF's dilution-transition logic: start from the least
-    diluted spectrum, inspect the last four valid overlap points before switching
-    dilution, use the same confidence-interval decision tree, then use the next
-    dilution for colder temperatures. OLAF's near-saturation pruning is applied
-    with a two-well Agresti-Coull margin.
+    When ``sample_group_by`` is omitted, groups are inferred from
+    ``sample_long_name``/``sample_name`` by stripping one trailing numeric token,
+    falling back to ``sample_id``. The stitching logic follows OLAF's
+    dilution-transition behavior: start from the least diluted spectrum, inspect
+    the last four valid overlap points before switching dilution, use the same
+    confidence-interval decision tree, then use the next dilution for colder
+    temperatures. OLAF's near-saturation pruning is applied with a two-well
+    Agresti-Coull margin.
     """
+
+    if _is_table_mapping(table):
+        return _map_merge_shape(
+            table,
+            lambda nested: temperature_frozen_fraction_to_stitched_cumulative_spectrum(
+                nested,
+                metadata_by_sample_id,
+                sample_group_by=sample_group_by,
+                enforce_monotone=enforce_monotone,
+                z=z,
+            ),
+        )
+    if _is_table_sequence(table):
+        table = _merged_fraction_input_for_stitch_or_mle(table)
 
     metadata_by_sample_id = resolve_metadata_by_sample_id(table, metadata_by_sample_id)
     per_dilution = temperature_frozen_fraction_to_cumulative_spectrum(
@@ -550,6 +904,15 @@ def temperature_frozen_fraction_to_stitched_cumulative_spectrum(
             value_unit="INP_per_mL_suspension",
             basis="suspension",
             metadata={},
+            processing_metadata=processing_metadata_for(
+                "cumulative_spec_stitch",
+                inputs=(table,),
+                parameters={
+                    "sample_group_by": _sample_group_by_parameter(sample_group_by),
+                    "enforce_monotone": enforce_monotone,
+                    "z": z,
+                },
+            ),
         )
 
     source_df["source_sample_id"] = source_df["sample_id"].astype(str)
@@ -593,6 +956,17 @@ def temperature_frozen_fraction_to_stitched_cumulative_spectrum(
             value_unit="INP_per_mL_suspension",
             basis="suspension",
             metadata=output_metadata,
+            processing_metadata=processing_metadata_for(
+                "cumulative_spec_stitch",
+                inputs=(table,),
+                parameters={
+                    "sample_group_by": _sample_group_by_parameter(sample_group_by),
+                    "enforce_monotone": enforce_monotone,
+                    "z": z,
+                },
+                source_sample_ids=_table_sample_ids_from_dataframe(source_df),
+                source_dilutions=_metadata_dilutions(metadata_by_sample_id),
+            ),
         )
     result = result.sort_values(["sample_id", "temperature_C"], ascending=[True, False])
     return CumulativeNucleusSpectrumTable.from_dataframe(
@@ -600,18 +974,30 @@ def temperature_frozen_fraction_to_stitched_cumulative_spectrum(
         value_unit="INP_per_mL_suspension",
         basis="suspension",
         metadata=output_metadata,
+        processing_metadata=processing_metadata_for(
+            "cumulative_spec_stitch",
+            inputs=(table,),
+            parameters={
+                "sample_group_by": _sample_group_by_parameter(sample_group_by),
+                "enforce_monotone": enforce_monotone,
+                "z": z,
+            },
+            source_sample_ids=_table_sample_ids_from_dataframe(source_df),
+            source_dilutions=_metadata_dilutions(metadata_by_sample_id),
+        ),
     )
 
 
 def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
-    table: TemperatureFrozenFractionTable,
+    table: TemperatureFrozenFractionTable | TableSequence | TableMapping,
     metadata_by_sample_id: dict[str, SampleMetadata] | None = None,
     *,
     sample_group_by: Literal["sample_id", "sample_name", "sample_long_name"]
-    | dict[str, str] = "sample_long_name",
+    | dict[str, str]
+    | None = None,
     enforce_monotone: bool = False,
     confidence_drop: float = PROFILE_LIKELIHOOD_DROP_95,
-) -> CumulativeNucleusSpectrumTable:
+) -> CumulativeNucleusSpectrumTable | dict[str, Any]:
     """Combine dilution rows with a binomial-Poisson MLE at each temperature.
 
     Each row contributes observed frozen counts ``x_j`` and total wells ``n_j``.
@@ -620,15 +1006,31 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
 
     p_j(K) = 1 - exp(-K * well_volume_mL / dilution_j)
 
-    ``sample_group_by`` defines which sample rows are treated as dilutions of the
-    same original sample. Use a dict for explicit sample_id -> group_id mapping,
-    or one of the metadata fields listed in the type annotation.
+    When ``sample_group_by`` is omitted, groups are inferred from
+    ``sample_long_name``/``sample_name`` by stripping one trailing numeric token,
+    falling back to ``sample_id``. Use a dict for sample_id -> group_id mapping,
+    or one of the metadata fields listed in the type annotation, when explicit
+    grouping is needed.
 
     When ``enforce_monotone`` is true, a monotone constrained MLE is fit by
     pooling adjacent temperature blocks until K(T) is nondecreasing toward colder
     temperatures. ``lower_ci`` and ``upper_ci`` remain OLAF-compatible error
     widths, not absolute limits.
     """
+
+    if _is_table_mapping(table):
+        return _map_merge_shape(
+            table,
+            lambda nested: temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
+                nested,
+                metadata_by_sample_id,
+                sample_group_by=sample_group_by,
+                enforce_monotone=enforce_monotone,
+                confidence_drop=confidence_drop,
+            ),
+        )
+    if _is_table_sequence(table):
+        table = _merged_fraction_input_for_stitch_or_mle(table)
 
     metadata_by_sample_id = resolve_metadata_by_sample_id(table, metadata_by_sample_id)
     source_df = table.to_dataframe()
@@ -642,6 +1044,15 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
             value_unit="INP_per_mL_suspension",
             basis="suspension",
             metadata={},
+            processing_metadata=processing_metadata_for(
+                "cumulative_spec_mle",
+                inputs=(table,),
+                parameters={
+                    "sample_group_by": _sample_group_by_parameter(sample_group_by),
+                    "enforce_monotone": enforce_monotone,
+                    "confidence_drop": confidence_drop,
+                },
+            ),
         )
 
     source_df["source_sample_id"] = source_df["sample_id"].astype(str)
@@ -687,6 +1098,17 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
             value_unit="INP_per_mL_suspension",
             basis="suspension",
             metadata=output_metadata,
+            processing_metadata=processing_metadata_for(
+                "cumulative_spec_mle",
+                inputs=(table,),
+                parameters={
+                    "sample_group_by": _sample_group_by_parameter(sample_group_by),
+                    "enforce_monotone": enforce_monotone,
+                    "confidence_drop": confidence_drop,
+                },
+                source_sample_ids=_table_sample_ids_from_dataframe(source_df),
+                source_dilutions=_metadata_dilutions(metadata_by_sample_id),
+            ),
         )
     result = result.sort_values(["sample_id", "temperature_C"], ascending=[True, False])
     return CumulativeNucleusSpectrumTable.from_dataframe(
@@ -694,14 +1116,34 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
         value_unit="INP_per_mL_suspension",
         basis="suspension",
         metadata=output_metadata,
+        processing_metadata=processing_metadata_for(
+            "cumulative_spec_mle",
+            inputs=(table,),
+            parameters={
+                "sample_group_by": _sample_group_by_parameter(sample_group_by),
+                "enforce_monotone": enforce_monotone,
+                "confidence_drop": confidence_drop,
+            },
+            source_sample_ids=_table_sample_ids_from_dataframe(source_df),
+            source_dilutions=_metadata_dilutions(metadata_by_sample_id),
+        ),
     )
 
 
 def cumulative_spectrum_to_normalized_inp_spectrum(
-    spectrum: CumulativeNucleusSpectrumTable,
+    spectrum: CumulativeNucleusSpectrumTable | TableSequence | TableMapping,
     metadata_by_sample_id: dict[str, SampleMetadata] | None = None,
-) -> NormalizedInpSpectrumTable:
+) -> NormalizedInpSpectrumTable | list[Any] | dict[str, Any]:
     """Normalize cumulative INP/mL suspension values to each sample basis."""
+
+    if _is_table_mapping(spectrum) or _is_table_sequence(spectrum):
+        return _map_table_shape(
+            spectrum,
+            lambda single_spectrum: cumulative_spectrum_to_normalized_inp_spectrum(
+                single_spectrum,
+                metadata_by_sample_id,
+            ),
+        )
 
     metadata_by_sample_id = resolve_metadata_by_sample_id(spectrum, metadata_by_sample_id)
     frames: list[pd.DataFrame] = []
@@ -733,10 +1175,8 @@ def cumulative_spectrum_to_normalized_inp_spectrum(
                 "value": value,
                 "value_unit": value_unit,
                 "basis": basis,
-                "inp_per_mL": sample_df["value"].to_numpy(dtype=float, copy=True),
                 "lower_ci": lower_ci,
                 "upper_ci": upper_ci,
-                "dilution_fold": metadata.dilution,
                 "qc_flag": sample_df["qc_flag"].to_numpy(dtype=int, copy=True)
                 if "qc_flag" in sample_df
                 else np.zeros(len(sample_df), dtype=int),
@@ -756,17 +1196,42 @@ def cumulative_spectrum_to_normalized_inp_spectrum(
             value_unit="unknown",
             basis="other",
             metadata=metadata_by_sample_id,
+            processing_metadata=processing_metadata_for(
+                "normalize_spec",
+                inputs=(spectrum,),
+                source_sample_ids=tuple(metadata_by_sample_id),
+                source_dilutions=_metadata_dilutions(metadata_by_sample_id),
+            ),
         )
-    return NormalizedInpSpectrumTable.from_dataframe(result, metadata=metadata_by_sample_id)
+    return NormalizedInpSpectrumTable.from_dataframe(
+        result,
+        metadata=metadata_by_sample_id,
+        processing_metadata=processing_metadata_for(
+            "normalize_spec",
+            inputs=(spectrum,),
+            source_sample_ids=_table_sample_ids_from_dataframe(result),
+            source_dilutions=_metadata_dilutions(metadata_by_sample_id),
+        ),
+    )
 
 
 def temperature_frozen_fraction_to_normalized_inp_spectrum(
-    table: TemperatureFrozenFractionTable,
+    table: TemperatureFrozenFractionTable | TableSequence | TableMapping,
     metadata_by_sample_id: dict[str, SampleMetadata] | None = None,
     *,
     z: float = 1.96,
-) -> NormalizedInpSpectrumTable:
+) -> NormalizedInpSpectrumTable | list[Any] | dict[str, Any]:
     """Convert temperature frozen fractions directly to normalized cumulative INP."""
+
+    if _is_table_mapping(table) or _is_table_sequence(table):
+        return _map_table_shape(
+            table,
+            lambda single_table: temperature_frozen_fraction_to_normalized_inp_spectrum(
+                single_table,
+                metadata_by_sample_id,
+                z=z,
+            ),
+        )
 
     cumulative = temperature_frozen_fraction_to_cumulative_spectrum(
         table,
@@ -1340,28 +1805,6 @@ def _source_row_for_stitch_result(
     return group_df.iloc[0]
 
 
-def _stitch_row_from_series(group_id: str, row: pd.Series) -> dict[str, Any]:
-    out = {
-        "sample_id": group_id,
-        "temperature_C": float(row["temperature_C"]),
-        "value": float(row["value"]),
-        "value_unit": str(row.get("value_unit", "INP_per_mL_suspension")),
-        "basis": str(row.get("basis", "suspension")),
-        "lower_ci": float(row["lower_ci"])
-        if "lower_ci" in row and pd.notna(row["lower_ci"])
-        else np.nan,
-        "upper_ci": float(row["upper_ci"])
-        if "upper_ci" in row and pd.notna(row["upper_ci"])
-        else np.nan,
-        "dilution_fold": float(row["dilution_fold"])
-        if "dilution_fold" in row and pd.notna(row["dilution_fold"])
-        else np.nan,
-        "qc_flag": int(row["qc_flag"]) if "qc_flag" in row and pd.notna(row["qc_flag"]) else 0,
-    }
-    _copy_temperature_row_metadata(row, out)
-    return out
-
-
 def _empty_stitch_row(
     group_id: str,
     temperature_C: float,
@@ -1405,8 +1848,12 @@ def _rms_pair(left: Any, right: Any) -> float:
 def _sample_group_id(
     sample_id: str,
     metadata: SampleMetadata,
-    sample_group_by: Literal["sample_id", "sample_name", "sample_long_name"] | dict[str, str],
+    sample_group_by: Literal["sample_id", "sample_name", "sample_long_name"]
+    | dict[str, str]
+    | None,
 ) -> str:
+    if sample_group_by is None:
+        return _inferred_sample_group_id(sample_id, metadata)
     if isinstance(sample_group_by, dict):
         if sample_id not in sample_group_by:
             raise KeyError(f"Missing sample group mapping for sample_id {sample_id!r}")
@@ -1420,6 +1867,32 @@ def _sample_group_id(
     if not group_id:
         raise ValueError(f"Empty sample group id for sample_id {sample_id!r}")
     return group_id
+
+
+def _sample_group_by_parameter(
+    sample_group_by: Literal["sample_id", "sample_name", "sample_long_name"]
+    | dict[str, str]
+    | None,
+) -> Any:
+    return "inferred" if sample_group_by is None else _plain_processing_value(sample_group_by)
+
+
+def _inferred_sample_group_id(sample_id: str, metadata: SampleMetadata) -> str:
+    label = metadata.sample_long_name or metadata.sample_name
+    if label:
+        return _strip_trailing_numeric_token(label)
+    return sample_id
+
+
+def _strip_trailing_numeric_token(value: str) -> str:
+    parts = str(value).rsplit("_", 1)
+    if len(parts) != 2:
+        return str(value)
+    try:
+        float(parts[1])
+    except ValueError:
+        return str(value)
+    return parts[0]
 
 
 def _shared_well_volume_uL(metadata_rows: list[SampleMetadata], group_id: str) -> float:
@@ -1438,22 +1911,48 @@ def _combined_source_metadata(
     source_metadata: list[SampleMetadata],
     source_prefix: str,
 ) -> SampleMetadata:
-    base = copy.deepcopy(source_metadata[0])
-    source_dilutions = [metadata.dilution for metadata in source_metadata]
-    raw_sample_metadata = dict(base.raw_sample_metadata)
-    raw_sample_metadata[f"{source_prefix}_source_sample_ids"] = ",".join(
-        map(str, source_sample_ids)
-    )
-    raw_sample_metadata[f"{source_prefix}_source_dilutions"] = ",".join(
-        "" if dilution is None else str(dilution) for dilution in source_dilutions
-    )
-    unique_dilutions = set(source_dilutions)
-    return replace(
-        base,
+    _ = source_prefix
+    _ = source_sample_ids
+    return SampleMetadata(
         sample_id=group_id,
-        dilution=None if len(unique_dilutions) > 1 else source_dilutions[0],
-        raw_sample_metadata=raw_sample_metadata,
+        sample_name=group_id,
+        sample_long_name=group_id,
+        sample_type=_shared_sample_type(source_metadata),
+        well_volume_uL=_shared_metadata_value(source_metadata, "well_volume_uL"),
+        reset_temperature_C=_shared_metadata_value(source_metadata, "reset_temperature_C"),
+        air_volume_L=_shared_metadata_value(source_metadata, "air_volume_L"),
+        filter_fraction_used=_shared_metadata_value(source_metadata, "filter_fraction_used"),
+        suspension_volume_mL=_shared_metadata_value(source_metadata, "suspension_volume_mL"),
+        dry_mass_g=_shared_metadata_value(source_metadata, "dry_mass_g"),
+        total_cells=_shared_metadata_value(source_metadata, "total_cells"),
+        dilution=_shared_metadata_value(source_metadata, "dilution"),
     )
+
+
+def _shared_sample_type(metadata_rows: list[SampleMetadata]) -> str:
+    sample_type = _shared_metadata_value(metadata_rows, "sample_type")
+    return str(sample_type) if sample_type else "other"
+
+
+def _shared_metadata_value(metadata_rows: list[SampleMetadata], field: str) -> Any:
+    if not metadata_rows:
+        return None
+    first = getattr(metadata_rows[0], field)
+    for metadata in metadata_rows[1:]:
+        if not _metadata_values_match(first, getattr(metadata, field)):
+            return None
+    return copy.deepcopy(first)
+
+
+def _metadata_values_match(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return left is None and right is None
+    if isinstance(left, (int, float, np.integer, np.floating)) or isinstance(
+        right,
+        (int, float, np.integer, np.floating),
+    ):
+        return bool(np.isclose(float(left), float(right), rtol=0.0, atol=1e-12))
+    return left == right
 
 
 def _array_or_none(df: pd.DataFrame, column: str) -> np.ndarray | None:

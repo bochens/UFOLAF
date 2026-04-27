@@ -51,7 +51,9 @@ def enforce_monotonic_vs_temperature(
                 values[index] = values[previous_index]
                 flags[index] = 1
                 if upper is not None:
-                    previous_upper = upper[previous_index] if np.isfinite(upper[previous_index]) else 0.0
+                    previous_upper = (
+                        upper[previous_index] if np.isfinite(upper[previous_index]) else 0.0
+                    )
                     current_upper = upper[index] if np.isfinite(upper[index]) else 0.0
                     upper[index] = np.sqrt(previous_upper**2 + current_upper**2)
                 if lower is not None:
@@ -100,16 +102,24 @@ def qc_blank_corrected_spectrum(
     if len(below) and below.mean() * 100.0 > threshold_percent:
         corrected.loc[below, ["value", "lower_ci", "upper_ci"]] = error_signal
 
-    fixed_value, fixed_lower, fixed_upper, flags = enforce_monotonic_vs_temperature(
-        corrected["temperature_C"].to_numpy(dtype=float),
-        corrected["value"].to_numpy(dtype=float),
-        corrected["lower_ci"].to_numpy(dtype=float),
-        corrected["upper_ci"].to_numpy(dtype=float),
+    valid = corrected["value"].to_numpy(dtype=float) != error_signal
+    existing_flags = (
+        corrected["qc_flag"].to_numpy(dtype=int, copy=True)
+        if "qc_flag" in corrected
+        else np.zeros(len(corrected), dtype=int)
     )
-    corrected["value"] = fixed_value
-    corrected["lower_ci"] = fixed_lower
-    corrected["upper_ci"] = fixed_upper
-    corrected["qc_flag"] = np.maximum(corrected.get("qc_flag", 0), flags)
+    if valid.any():
+        fixed_value, fixed_lower, fixed_upper, flags = enforce_monotonic_vs_temperature(
+            corrected.loc[valid, "temperature_C"].to_numpy(dtype=float),
+            corrected.loc[valid, "value"].to_numpy(dtype=float),
+            corrected.loc[valid, "lower_ci"].to_numpy(dtype=float),
+            corrected.loc[valid, "upper_ci"].to_numpy(dtype=float),
+        )
+        corrected.loc[valid, "value"] = fixed_value
+        corrected.loc[valid, "lower_ci"] = fixed_lower
+        corrected.loc[valid, "upper_ci"] = fixed_upper
+        existing_flags[valid] = np.maximum(existing_flags[valid], flags)
+    corrected["qc_flag"] = existing_flags
     return corrected
 
 
