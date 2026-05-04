@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Literal
+import warnings
+from typing import Any, Literal, Mapping
 
 import numpy as np
 import pandas as pd
@@ -894,6 +895,7 @@ def temperature_frozen_fraction_to_stitched_cumulative_spectrum(
     counts_df = table.to_dataframe()[
         ["sample_id", "temperature_C", "n_total", "n_frozen"]
     ].copy()
+    _raise_on_duplicate_stitch_source_temperatures(source_df, counts_df)
     if source_df.empty:
         return CumulativeNucleusSpectrumTable(
             sample_id=np.array([], dtype=object),
@@ -933,6 +935,7 @@ def temperature_frozen_fraction_to_stitched_cumulative_spectrum(
     for group_id, group_df in source_df.groupby("stitch_group_id", sort=False):
         group_sample_ids = group_df["source_sample_id"].astype(str).unique()
         group_metadata = [metadata_by_sample_id[sample_id] for sample_id in group_sample_ids]
+        _warn_on_combined_metadata_mismatches(str(group_id), group_metadata, "stitch")
         output_metadata.setdefault(
             str(group_id),
             _combined_source_metadata(str(group_id), group_sample_ids, group_metadata, "stitch"),
@@ -997,6 +1000,11 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
     | None = None,
     enforce_monotone: bool = False,
     confidence_drop: float = PROFILE_LIKELIHOOD_DROP_95,
+    temperature_eligibility_C: Mapping[Any, float] | None = None,
+    dilution_likelihood_weights: Mapping[Any, float] | None = None,
+    dilution_action_counts: Mapping[Any, float] | None = None,
+    action_weight_lambda: float | None = None,
+    action_weight_half_life: float | None = None,
 ) -> CumulativeNucleusSpectrumTable | dict[str, Any]:
     """Combine dilution rows with a binomial-Poisson MLE at each temperature.
 
@@ -1016,7 +1024,25 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
     pooling adjacent temperature blocks until K(T) is nondecreasing toward colder
     temperatures. ``lower_ci`` and ``upper_ci`` remain OLAF-compatible error
     widths, not absolute limits.
+
+    ``temperature_eligibility_C`` maps dilution fold to the warmest temperature
+    that dilution is allowed to contribute. For example ``{169: -20.0}`` keeps
+    dilution 169 only at ``T <= -20 C``. ``dilution_likelihood_weights`` maps
+    dilution fold to direct likelihood weights. Alternatively,
+    ``dilution_action_counts`` can be combined with ``action_weight_lambda`` or
+    ``action_weight_half_life`` to compute exponential action-decay weights.
     """
+
+    mle_parameters = _mle_processing_parameters(
+        sample_group_by=sample_group_by,
+        enforce_monotone=enforce_monotone,
+        confidence_drop=confidence_drop,
+        temperature_eligibility_C=temperature_eligibility_C,
+        dilution_likelihood_weights=dilution_likelihood_weights,
+        dilution_action_counts=dilution_action_counts,
+        action_weight_lambda=action_weight_lambda,
+        action_weight_half_life=action_weight_half_life,
+    )
 
     if _is_table_mapping(table):
         return _map_merge_shape(
@@ -1027,6 +1053,11 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
                 sample_group_by=sample_group_by,
                 enforce_monotone=enforce_monotone,
                 confidence_drop=confidence_drop,
+                temperature_eligibility_C=temperature_eligibility_C,
+                dilution_likelihood_weights=dilution_likelihood_weights,
+                dilution_action_counts=dilution_action_counts,
+                action_weight_lambda=action_weight_lambda,
+                action_weight_half_life=action_weight_half_life,
             ),
         )
     if _is_table_sequence(table):
@@ -1047,11 +1078,7 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
             processing_metadata=processing_metadata_for(
                 "cumulative_spec_mle",
                 inputs=(table,),
-                parameters={
-                    "sample_group_by": _sample_group_by_parameter(sample_group_by),
-                    "enforce_monotone": enforce_monotone,
-                    "confidence_drop": confidence_drop,
-                },
+                parameters=mle_parameters,
             ),
         )
 
@@ -1060,12 +1087,26 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
         _sample_group_id(sample_id, metadata_by_sample_id[sample_id], sample_group_by)
         for sample_id in source_df["source_sample_id"]
     ]
+    source_df = _apply_mle_temperature_eligibility(
+        source_df,
+        metadata_by_sample_id,
+        temperature_eligibility_C,
+    )
+    source_df["mle_likelihood_weight"] = _mle_likelihood_weights(
+        source_df,
+        metadata_by_sample_id,
+        dilution_likelihood_weights=dilution_likelihood_weights,
+        dilution_action_counts=dilution_action_counts,
+        action_weight_lambda=action_weight_lambda,
+        action_weight_half_life=action_weight_half_life,
+    )
 
     output_metadata: dict[str, SampleMetadata] = {}
     frames: list[pd.DataFrame] = []
     for group_id, mle_group_df in source_df.groupby("mle_group_id", sort=False):
         metadata_sample_ids = mle_group_df["source_sample_id"].astype(str).unique()
         metadata_rows = [metadata_by_sample_id[sample_id] for sample_id in metadata_sample_ids]
+        _warn_on_combined_metadata_mismatches(str(group_id), metadata_rows, "mle")
         output_metadata.setdefault(
             str(group_id),
             _combined_source_metadata(str(group_id), metadata_sample_ids, metadata_rows, "mle"),
@@ -1101,11 +1142,7 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
             processing_metadata=processing_metadata_for(
                 "cumulative_spec_mle",
                 inputs=(table,),
-                parameters={
-                    "sample_group_by": _sample_group_by_parameter(sample_group_by),
-                    "enforce_monotone": enforce_monotone,
-                    "confidence_drop": confidence_drop,
-                },
+                parameters=mle_parameters,
                 source_sample_ids=_table_sample_ids_from_dataframe(source_df),
                 source_dilutions=_metadata_dilutions(metadata_by_sample_id),
             ),
@@ -1119,11 +1156,7 @@ def temperature_frozen_fraction_to_binomial_mle_cumulative_spectrum(
         processing_metadata=processing_metadata_for(
             "cumulative_spec_mle",
             inputs=(table,),
-            parameters={
-                "sample_group_by": _sample_group_by_parameter(sample_group_by),
-                "enforce_monotone": enforce_monotone,
-                "confidence_drop": confidence_drop,
-            },
+            parameters=mle_parameters,
             source_sample_ids=_table_sample_ids_from_dataframe(source_df),
             source_dilutions=_metadata_dilutions(metadata_by_sample_id),
         ),
@@ -1428,11 +1461,17 @@ def _mle_fit_for_rows(
     if np.any(dilution <= 0):
         raise ValueError(f"All dilutions must be positive for MLE group {group_id!r}")
 
+    likelihood_weight = (
+        fit_df["mle_likelihood_weight"].to_numpy(dtype=float, copy=True)
+        if "mle_likelihood_weight" in fit_df
+        else np.ones(len(fit_df), dtype=float)
+    )
     value, lower_error, upper_error, finite = binomial_poisson_mle_with_profile_errors(
         fit_df["n_frozen"].to_numpy(dtype=float, copy=True),
         fit_df["n_total"].to_numpy(dtype=float, copy=True),
         well_volume_uL,
         dilution,
+        likelihood_weight=likelihood_weight,
         confidence_drop=confidence_drop,
     )
     dilution_fold = dilution[0] if len(pd.unique(dilution)) == 1 else np.nan
@@ -1464,6 +1503,236 @@ def _mle_result_row(
     return out
 
 
+def _mle_processing_parameters(
+    *,
+    sample_group_by: Literal["sample_id", "sample_name", "sample_long_name"]
+    | dict[str, str]
+    | None,
+    enforce_monotone: bool,
+    confidence_drop: float,
+    temperature_eligibility_C: Mapping[Any, float] | None,
+    dilution_likelihood_weights: Mapping[Any, float] | None,
+    dilution_action_counts: Mapping[Any, float] | None,
+    action_weight_lambda: float | None,
+    action_weight_half_life: float | None,
+) -> dict[str, Any]:
+    if dilution_likelihood_weights is not None and dilution_action_counts is not None:
+        raise ValueError(
+            "Pass either dilution_likelihood_weights or dilution_action_counts, not both"
+        )
+    if dilution_action_counts is None and (
+        action_weight_lambda is not None or action_weight_half_life is not None
+    ):
+        raise ValueError(
+            "action_weight_lambda/action_weight_half_life require dilution_action_counts"
+        )
+    resolved_lambda = _resolve_action_weight_lambda(
+        action_weight_lambda,
+        action_weight_half_life,
+        require=dilution_action_counts is not None,
+    )
+    return {
+        "sample_group_by": _sample_group_by_parameter(sample_group_by),
+        "enforce_monotone": enforce_monotone,
+        "confidence_drop": confidence_drop,
+        "temperature_eligibility_C": _plain_processing_value(
+            _normalize_numeric_mapping(
+                temperature_eligibility_C,
+                name="temperature_eligibility_C",
+            )
+        ),
+        "dilution_likelihood_weights": _plain_processing_value(
+            _normalize_numeric_mapping(
+                dilution_likelihood_weights,
+                name="dilution_likelihood_weights",
+                require_positive_values=True,
+            )
+        ),
+        "dilution_action_counts": _plain_processing_value(
+            _normalize_numeric_mapping(
+                dilution_action_counts,
+                name="dilution_action_counts",
+                require_nonnegative_values=True,
+            )
+        ),
+        "action_weight_lambda": resolved_lambda,
+        "action_weight_half_life": action_weight_half_life,
+    }
+
+
+def _apply_mle_temperature_eligibility(
+    source_df: pd.DataFrame,
+    metadata_by_sample_id: dict[str, SampleMetadata],
+    temperature_eligibility_C: Mapping[Any, float] | None,
+) -> pd.DataFrame:
+    eligibility = _normalize_numeric_mapping(
+        temperature_eligibility_C,
+        name="temperature_eligibility_C",
+    )
+    if not eligibility or source_df.empty:
+        return source_df
+
+    keep: list[bool] = []
+    for _, row in source_df.iterrows():
+        sample_id = str(row["source_sample_id"])
+        dilution = _metadata_dilution(
+            metadata_by_sample_id[sample_id],
+            sample_id,
+            context="temperature_eligibility_C",
+        )
+        warmest_allowed = _mapped_dilution_value(
+            eligibility,
+            dilution,
+            default=None,
+            name="temperature_eligibility_C",
+        )
+        keep.append(
+            warmest_allowed is None
+            or float(row["temperature_C"]) <= float(warmest_allowed)
+        )
+    return source_df.loc[np.array(keep, dtype=bool)].copy()
+
+
+def _mle_likelihood_weights(
+    source_df: pd.DataFrame,
+    metadata_by_sample_id: dict[str, SampleMetadata],
+    *,
+    dilution_likelihood_weights: Mapping[Any, float] | None,
+    dilution_action_counts: Mapping[Any, float] | None,
+    action_weight_lambda: float | None,
+    action_weight_half_life: float | None,
+) -> np.ndarray:
+    if source_df.empty:
+        return np.array([], dtype=float)
+    if dilution_likelihood_weights is not None and dilution_action_counts is not None:
+        raise ValueError(
+            "Pass either dilution_likelihood_weights or dilution_action_counts, not both"
+        )
+
+    direct_weights = _normalize_numeric_mapping(
+        dilution_likelihood_weights,
+        name="dilution_likelihood_weights",
+        require_positive_values=True,
+    )
+    action_counts = _normalize_numeric_mapping(
+        dilution_action_counts,
+        name="dilution_action_counts",
+        require_nonnegative_values=True,
+    )
+    action_lambda = _resolve_action_weight_lambda(
+        action_weight_lambda,
+        action_weight_half_life,
+        require=action_counts is not None,
+    )
+
+    weights: list[float] = []
+    for sample_id in source_df["source_sample_id"].astype(str):
+        dilution = _metadata_dilution(
+            metadata_by_sample_id[sample_id],
+            sample_id,
+            context="likelihood weighting",
+        )
+        if direct_weights is not None:
+            weights.append(
+                float(
+                    _mapped_dilution_value(
+                        direct_weights,
+                        dilution,
+                        default=1.0,
+                        name="dilution_likelihood_weights",
+                    )
+                )
+            )
+            continue
+        if action_counts is not None:
+            action_count = float(
+                _mapped_dilution_value(
+                    action_counts,
+                    dilution,
+                    default=0.0,
+                    name="dilution_action_counts",
+                )
+            )
+            weights.append(float(np.exp(-float(action_lambda) * action_count)))
+            continue
+        weights.append(1.0)
+    return np.array(weights, dtype=float)
+
+
+def _resolve_action_weight_lambda(
+    action_weight_lambda: float | None,
+    action_weight_half_life: float | None,
+    *,
+    require: bool,
+) -> float | None:
+    if action_weight_lambda is not None and action_weight_half_life is not None:
+        raise ValueError("Pass action_weight_lambda or action_weight_half_life, not both")
+    if action_weight_half_life is not None:
+        if action_weight_half_life <= 0:
+            raise ValueError("action_weight_half_life must be positive")
+        return float(np.log(2.0) / action_weight_half_life)
+    if action_weight_lambda is not None:
+        if action_weight_lambda < 0:
+            raise ValueError("action_weight_lambda cannot be negative")
+        return float(action_weight_lambda)
+    if require:
+        raise ValueError(
+            "dilution_action_counts requires action_weight_lambda or action_weight_half_life"
+        )
+    return None
+
+
+def _metadata_dilution(metadata: SampleMetadata, sample_id: str, *, context: str) -> float:
+    if metadata.dilution is None:
+        raise ValueError(f"Sample {sample_id!r} is missing dilution for {context}")
+    dilution = float(metadata.dilution)
+    if not np.isfinite(dilution) or dilution <= 0:
+        raise ValueError(f"Sample {sample_id!r} has invalid dilution for {context}")
+    return dilution
+
+
+def _normalize_numeric_mapping(
+    values: Mapping[Any, float] | None,
+    *,
+    name: str,
+    require_positive_values: bool = False,
+    require_nonnegative_values: bool = False,
+) -> dict[float, float] | None:
+    if values is None:
+        return None
+    normalized: dict[float, float] = {}
+    for key, value in values.items():
+        key_float = float(key)
+        value_float = float(value)
+        if not np.isfinite(key_float):
+            raise ValueError(f"{name} contains a non-finite dilution key")
+        if not np.isfinite(value_float):
+            raise ValueError(f"{name} contains a non-finite value for dilution {key!r}")
+        if require_positive_values and value_float <= 0:
+            raise ValueError(f"{name} values must be positive")
+        if require_nonnegative_values and value_float < 0:
+            raise ValueError(f"{name} values cannot be negative")
+        if key_float in normalized:
+            raise ValueError(f"{name} contains duplicate dilution key {key_float:g}")
+        normalized[key_float] = value_float
+    return normalized
+
+
+def _mapped_dilution_value(
+    values: dict[float, float],
+    dilution: float,
+    *,
+    default: float | None,
+    name: str,
+) -> float | None:
+    if dilution in values:
+        return values[dilution]
+    for key, value in values.items():
+        if np.isclose(key, dilution, rtol=0.0, atol=1e-12):
+            return value
+    return default
+
+
 def _normalize_metadata_mapping(metadata: MetadataLike) -> dict[str, SampleMetadata]:
     if not isinstance(metadata, dict):
         raise TypeError("metadata must be a dict of SampleMetadata objects")
@@ -1474,6 +1743,46 @@ def _normalize_metadata_mapping(metadata: MetadataLike) -> dict[str, SampleMetad
         if not isinstance(value, SampleMetadata):
             raise TypeError("metadata values must be SampleMetadata objects")
     return copied
+
+
+def _raise_on_duplicate_stitch_source_temperatures(
+    source_df: pd.DataFrame,
+    counts_df: pd.DataFrame,
+) -> None:
+    """Raise a domain error before pandas reports a one-to-one merge failure."""
+
+    for name, frame in (("cumulative", source_df), ("fraction", counts_df)):
+        if frame.empty:
+            continue
+        duplicate_mask = frame.duplicated(["sample_id", "temperature_C"], keep=False)
+        if not duplicate_mask.any():
+            continue
+        examples = _duplicate_key_examples(
+            frame.loc[duplicate_mask],
+            ["sample_id", "temperature_C"],
+        )
+        raise ValueError(
+            f"Stitch input contains repeated {name} rows for the same source sample "
+            f"and temperature: {examples}. UFOLAF cannot stitch repeated experiments "
+            "with the same source sample_id because it cannot tell whether the rows "
+            "are replicate measurements or conflicting records. Give each experiment "
+            "a unique source sample_id and aggregate replicates before stitching, run "
+            "them separately, or use MLE if independent well counts should be fitted "
+            "together."
+        )
+
+
+def _duplicate_key_examples(df: pd.DataFrame, columns: list[str]) -> str:
+    duplicates = (
+        df.loc[df.duplicated(columns, keep=False), columns]
+        .drop_duplicates()
+        .head(5)
+        .to_dict(orient="records")
+    )
+    return ", ".join(
+        "(" + ", ".join(f"{column}={row[column]!r}" for column in columns) + ")"
+        for row in duplicates
+    )
 
 
 def _stitch_cumulative_group(
@@ -1496,7 +1805,15 @@ def _stitch_cumulative_group(
             ]
         )
     if group_df.duplicated(["temperature_C", "dilution_fold"]).any():
-        raise ValueError(f"Duplicate temperature/dilution rows found for stitch group {group_id!r}")
+        examples = _duplicate_key_examples(group_df, ["temperature_C", "dilution_fold"])
+        raise ValueError(
+            f"Stitch group {group_id!r} contains repeated temperature/dilution rows: "
+            f"{examples}. UFOLAF currently expects at most one row for each temperature "
+            "and dilution in a stitch group. This usually means the same physical sample "
+            "and dilution were measured in multiple experiments. Aggregate those replicate "
+            "experiments before stitching, run them separately, or use MLE if independent "
+            "well counts should be fitted together."
+        )
 
     value_matrix = _stitch_matrix(group_df, "value", temperatures, dilutions)
     lower_matrix = _stitch_matrix(group_df, "lower_ci", temperatures, dilutions)
@@ -1903,6 +2220,98 @@ def _shared_well_volume_uL(metadata_rows: list[SampleMetadata], group_id: str) -
     if not np.allclose(values, values[0], rtol=0.0, atol=1e-12):
         raise ValueError(f"All wells in MLE group {group_id!r} must use the same well volume")
     return values[0]
+
+
+def _warn_on_combined_metadata_mismatches(
+    group_id: str,
+    metadata_rows: list[SampleMetadata],
+    operation: str,
+) -> None:
+    if len(metadata_rows) < 2:
+        return
+    for label, attr, raw_keys in (
+        ("site", None, ("site",)),
+        ("start_time", "collection_start", ("start_time",)),
+        ("end_time", "collection_end", ("end_time",)),
+        ("vol_air_filt", "air_volume_L", ("vol_air_filt", "air_volume_L")),
+        (
+            "proportion_filter_used",
+            "filter_fraction_used",
+            ("proportion_filter_used", "filter_fraction_used"),
+        ),
+        ("vol_susp", "suspension_volume_mL", ("vol_susp", "suspension_volume_mL")),
+    ):
+        _warn_on_metadata_mismatch(group_id, metadata_rows, operation, label, attr, raw_keys)
+
+
+def _warn_on_metadata_mismatch(
+    group_id: str,
+    metadata_rows: list[SampleMetadata],
+    operation: str,
+    label: str,
+    attr: str | None,
+    raw_keys: tuple[str, ...],
+) -> None:
+    values = [
+        value
+        for value in (
+            _metadata_warning_value(metadata, attr, raw_keys)
+            for metadata in metadata_rows
+        )
+        if not _metadata_warning_missing(value)
+    ]
+    if len(values) < 2:
+        return
+    first = values[0]
+    if all(_metadata_values_match(first, value) for value in values[1:]):
+        return
+    display_values = ", ".join(str(value) for value in values)
+    warnings.warn(
+        f"{operation} group {group_id!r} combines source metadata with different "
+        f"{label} values: {display_values}. Different dilutions are expected, but "
+        "site, start/end time, sampled air volume, filter fraction, and suspension "
+        "volume should usually match when combining one physical sample.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def _metadata_warning_value(
+    metadata: SampleMetadata,
+    attr: str | None,
+    raw_keys: tuple[str, ...],
+) -> Any:
+    value = getattr(metadata, attr, None) if attr else None
+    if not _metadata_warning_missing(value):
+        return value
+    normalized_keys = _metadata_warning_key_variants(raw_keys)
+    for mapping in (metadata.raw_sample_metadata, metadata.raw_preamble):
+        lookup = {str(key).casefold(): item for key, item in (mapping or {}).items()}
+        for key in normalized_keys:
+            if key in lookup and not _metadata_warning_missing(lookup[key]):
+                return lookup[key]
+    return None
+
+
+def _metadata_warning_key_variants(keys: tuple[str, ...]) -> tuple[str, ...]:
+    variants: list[str] = []
+    for key in keys:
+        variants.extend((key, key.replace("_", " "), key.replace(" ", "_")))
+    return tuple(dict.fromkeys(value.casefold() for value in variants))
+
+
+def _metadata_warning_missing(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(missing, (bool, np.bool_)):
+        return bool(missing)
+    return False
 
 
 def _combined_source_metadata(
